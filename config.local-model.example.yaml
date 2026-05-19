@@ -1,0 +1,87 @@
+service:
+  timezone: "Asia/Shanghai"
+  poll_interval_seconds: 30
+  processing_parallelism: 1
+  data_dir: "data/local-model"
+  log_level: "INFO"
+
+rooms:
+  - name: "示例房间"
+    room_id: 521297
+    url: "https://www.showroom-live.com/r/seira0605"
+    enabled: true
+
+record:
+  strategy: "ffmpeg"
+  min_file_size_mb: 0.1
+
+transcode:
+  enabled: true
+  ffmpeg_bin: "ffmpeg"
+  width: 1280
+  height: 720
+  fps: 30
+  scale_mode: "fit"
+  video_codec: "libx264"
+  preset: "veryfast"
+  crf: 23
+  audio_codec: "aac"
+  audio_bitrate: "128k"
+  extra_args: []
+
+asr:
+  enabled: true
+  provider: "faster_whisper"
+  # 可以填模型名，也可以填你下载好的本地 CTranslate2/faster-whisper 模型目录。
+  # 例如："models/asr/faster-whisper-large-v3"
+  model: "models/asr/faster-whisper-large-v3"
+  device: "auto"       # auto | cpu | cuda
+  compute_type: "auto" # auto | int8 | float16 | float32
+  language: "ja"
+  beam_size: 5
+  vad_filter: true
+
+translation:
+  enabled: true
+  provider: "transformers_seq2seq"
+  batch_size: 8
+  retries: 1
+  transformers:
+    # 指向你下载好的 Hugging Face seq2seq 翻译模型目录。
+    # NLLB 示例语言代码：日语 jpn_Jpan -> 简中 zho_Hans
+    model_path: "models/translation/nllb-200-distilled-600M"
+    local_files_only: true
+    source_lang: "jpn_Jpan"
+    target_lang: "zho_Hans"
+    device: "auto"       # auto | cpu | cuda
+    torch_dtype: "float16"
+    batch_size: 8
+    max_input_tokens: 256
+    max_new_tokens: 160
+    num_beams: 4
+
+subtitles:
+  max_line_chars: 24
+  bilingual: false
+
+upload:
+  enabled: false
+  uploader: "biliup"
+  subtitle_mode: "hard_subbed"
+  biliup:
+    bin: "biliup"
+    user_cookie: "data/biliup-cookies.json"
+    line: "kodo"
+    limit: 3
+    tid: 21
+    copyright: 2
+    source_template: "{room_url}"
+    tags:
+      - "SHOWROOM"
+      - "直播录像"
+    cover: ""
+    desc_format_id: 0
+    open_subtitle: true
+    subtitle_language: "zh-CN"
+    upload_subtitle_draft: false
+    extra_args: []

@@ -1,0 +1,134 @@
+service:
+  timezone: "Asia/Shanghai"
+  poll_interval_seconds: 30
+  processing_parallelism: 1
+  data_dir: "data"
+  log_level: "INFO"
+
+rooms:
+  - name: "示例房间"
+    room_id: 123456
+    url: "https://www.showroom-live.com/r/example"
+    poll_interval_seconds: 30
+    enabled: false
+
+naming:
+  filename_template: "{streamer}_{started_at:%Y%m%d_%H%M%S}_{title_slug}"
+  title_template: "【{streamer}】SHOWROOM直播录像 {started_at:%Y-%m-%d %H:%M}"
+  desc_template: |
+    自动录制的 SHOWROOM 直播录像。
+    主播：{streamer}
+    直播间：{room_url}
+    录制时间：{started_at:%Y-%m-%d %H:%M:%S}
+  dynamic_template: "{streamer} SHOWROOM直播录像"
+
+record:
+  strategy: "yt_dlp"
+  yt_dlp_bin: "yt-dlp"
+  extra_args: []
+  cookies_file: ""
+  min_file_size_mb: 5
+
+transcode:
+  enabled: true
+  ffmpeg_bin: "ffmpeg"
+  width: 1920
+  height: 1080
+  fps: 30
+  scale_mode: "fit"
+  video_codec: "libx264"
+  preset: "medium"
+  crf: 20
+  audio_codec: "aac"
+  audio_bitrate: "192k"
+  extra_args: []
+
+asr:
+  enabled: true
+  provider: "openai" # openai | openai_compatible
+  model: "gpt-4o-transcribe-diarize"
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  organization_env: "OPENAI_ORG_ID"
+  project_env: "OPENAI_PROJECT_ID"
+  trust_env: false
+  timeout_seconds: 300
+  retries: 3
+  language: "ja"
+  chunk_seconds: 180
+  max_file_size_mb: 24
+  audio_format: "mp3"
+  audio_bitrate: "64k"
+  response_format: "diarized_json"
+  chunking_strategy: "auto"
+  prompt: ""
+
+translation:
+  enabled: true
+  provider: "openai_responses"
+  batch_size: 20
+  retries: 3
+  openai_responses:
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    organization_env: "OPENAI_ORG_ID"
+    project_env: "OPENAI_PROJECT_ID"
+    trust_env: false
+    model: "gpt-5.5"
+    reasoning_effort: "high"
+    max_output_tokens: 8192
+    timeout_seconds: 180
+  openai_compatible:
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    trust_env: false
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    timeout_seconds: 120
+    json_mode: false
+  transformers:
+    model_path: "models/translation/nllb-200-distilled-600M"
+    local_files_only: true
+    source_lang: "jpn_Jpan"
+    target_lang: "zho_Hans"
+    device: "auto"
+    torch_dtype: "float16"
+    batch_size: 8
+    max_input_tokens: 256
+    max_new_tokens: 160
+    num_beams: 4
+  deepl:
+    api_key_env: "DEEPL_API_KEY"
+    endpoint: "https://api-free.deepl.com/v2/translate"
+    target_lang: "ZH-HANS"
+  argos:
+    from_lang: "ja"
+    to_lang: "zh"
+  external:
+    command: []
+
+subtitles:
+  max_line_chars: 24
+  bilingual: false
+
+upload:
+  enabled: false
+  uploader: "biliup"
+  subtitle_mode: "hard_subbed" # hard_subbed | sidecar | none
+  biliup:
+    bin: "biliup"
+    user_cookie: "data/biliup-cookies.json"
+    line: "kodo"
+    limit: 3
+    tid: 21
+    copyright: 2
+    source_template: "{room_url}"
+    tags:
+      - "SHOWROOM"
+      - "直播录像"
+    cover: ""
+    desc_format_id: 0
+    open_subtitle: true
+    subtitle_language: "zh-CN"
+    upload_subtitle_draft: false
+    extra_args: []

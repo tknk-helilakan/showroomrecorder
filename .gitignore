@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+config.yaml
+
+# Local model files can be very large. Keep the directory placeholders,
+# but never commit downloaded ASR/translation model weights.
+models/asr/*
+!models/asr/.gitkeep
+models/translation/*
+!models/translation/.gitkeep

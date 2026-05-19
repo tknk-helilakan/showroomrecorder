@@ -1,0 +1,8 @@
+# Optional local-model dependencies.
+# Python 3.10+ is strongly recommended for current PyTorch/Transformers builds.
+faster-whisper>=1.1.0
+torch>=2.2
+transformers>=4.40
+sentencepiece>=0.2
+protobuf>=4.25
+
