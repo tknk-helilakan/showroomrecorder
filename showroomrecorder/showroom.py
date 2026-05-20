@@ -70,21 +70,30 @@ class ShowroomClient:
     def get_live_status(self, room: RoomConfig) -> LiveStatus:
         room_id = self.ensure_room_id(room)
         raw: dict[str, Any] = {}
+        profile: dict[str, Any] = {}
+
+        try:
+            profile = self._get_json("/api/room/profile", {"room_id": room_id})
+        except requests.RequestException as exc:
+            LOGGER.warning("SHOWROOM profile request failed for %s: %s", room.name, exc)
+
         try:
             raw = self._get_json("/api/room/is_live", {"room_id": room_id})
+        except requests.HTTPError as exc:
+            response = exc.response
+            if response is None or response.status_code != 404:
+                LOGGER.warning("SHOWROOM is_live request failed for %s: %s", room.name, exc)
+            else:
+                LOGGER.debug("SHOWROOM is_live endpoint returned 404 for %s; profile fallback is used", room.name)
         except requests.RequestException as exc:
             LOGGER.warning("SHOWROOM is_live request failed for %s: %s", room.name, exc)
 
-        is_live = bool(raw.get("is_live") or raw.get("is_live_now"))
-        profile: dict[str, Any] = {}
-        if not is_live:
-            try:
-                profile = self._get_json("/api/room/profile", {"room_id": room_id})
-                is_live = profile.get("is_onlive") is True
-            except requests.RequestException as exc:
-                LOGGER.warning("SHOWROOM profile request failed for %s: %s", room.name, exc)
-
-        merged = {**profile, **raw}
+        is_live = bool(
+            profile.get("is_onlive") is True
+            or raw.get("is_live")
+            or raw.get("is_live_now")
+        )
+        merged = {**raw, **profile}
         title = ""
         if is_live:
             for key in ("live_title", "room_name", "main_name", "performer_name", "name", "title"):
