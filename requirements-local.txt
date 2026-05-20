@@ -1,8 +1,11 @@
 # Optional local-model dependencies.
-# Python 3.10+ is strongly recommended for current PyTorch/Transformers builds.
-faster-whisper>=1.1.0
-torch>=2.2
-transformers>=4.40
+# Python 3.10+ is strongly recommended. The bounds below keep Python 3.8 usable.
+faster-whisper>=0.10.0,<1.1.0; python_version < "3.9"
+faster-whisper>=1.1.0; python_version >= "3.9"
+torch>=2.2,<2.5; python_version < "3.9"
+torch>=2.2; python_version >= "3.9"
+transformers>=4.40,<4.47; python_version < "3.9"
+transformers>=4.40; python_version >= "3.9"
 sentencepiece>=0.2
 protobuf>=4.25
-
+huggingface_hub>=0.23

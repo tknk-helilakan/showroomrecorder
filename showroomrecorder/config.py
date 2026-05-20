@@ -53,6 +53,7 @@ class RecordConfig:
     extra_args: list[str] = field(default_factory=list)
     cookies_file: Path | None = None
     min_file_size_mb: float = 5
+    max_seconds: int | None = None
 
 
 @dataclass

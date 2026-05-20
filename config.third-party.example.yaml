@@ -1,12 +1,57 @@
-# 第三方 OpenAI 兼容端点示例。
-# 前提：供应商必须实际提供对应能力；仅有 API Key 不能绕过模型供应商限制。
+# Third-party OpenAI-compatible endpoint example.
+# Edit rooms before running. Only set enabled: true for rooms you really want to monitor.
+
+service:
+  timezone: "Asia/Shanghai"
+  poll_interval_seconds: 30
+  processing_parallelism: 1
+  data_dir: "data/third-party"
+  log_level: "INFO"
+
+rooms:
+  # Replace this with your own SHOWROOM rooms and set enabled: true.
+  - name: "示例房间"
+    room_id: 123456
+    url: "https://www.showroom-live.com/r/example"
+    enabled: false
+
+naming:
+  filename_template: "{streamer}_{started_at:%Y%m%d_%H%M%S}_{title_slug}"
+  title_template: "【{streamer}】SHOWROOM直播录像 {started_at:%Y-%m-%d %H:%M}"
+  desc_template: |
+    自动录制的 SHOWROOM 直播录像。
+    主播：{streamer}
+    直播间：{room_url}
+    录制时间：{started_at:%Y-%m-%d %H:%M:%S}
+  dynamic_template: "{streamer} SHOWROOM直播录像"
+
+record:
+  strategy: "yt_dlp"
+  yt_dlp_bin: "yt-dlp"
+  extra_args: []
+  cookies_file: ""
+  min_file_size_mb: 5
+
+transcode:
+  enabled: true
+  ffmpeg_bin: "ffmpeg"
+  width: 1920
+  height: 1080
+  fps: 30
+  scale_mode: "fit"
+  video_codec: "libx264"
+  preset: "medium"
+  crf: 20
+  audio_codec: "aac"
+  audio_bitrate: "192k"
+  extra_args: []
 
 asr:
   enabled: true
   provider: "openai_compatible"
-  # 如果第三方代理真实转发 OpenAI 音频接口，可以继续使用 OpenAI 模型名。
-  # 如果是第三方自己的音频模型，改成供应商文档里的模型名。
-  model: "gpt-4o-transcribe-diarize"
+  # The provider must support /audio/transcriptions. If it only supports text chat,
+  # use local faster_whisper for ASR instead.
+  model: "provider-asr-model-name"
   base_url: "https://your-provider.example.com/v1"
   api_key_env: "THIRD_PARTY_API_KEY"
   organization_env: ""
@@ -19,37 +64,58 @@ asr:
   max_file_size_mb: 24
   audio_format: "mp3"
   audio_bitrate: "64k"
-  response_format: "diarized_json"
-  chunking_strategy: "auto"
+  response_format: "json"
+  chunking_strategy: ""
   prompt: ""
 
-# 情况 A：供应商兼容 OpenAI Responses API。
 translation:
   enabled: true
-  provider: "openai_responses"
+  # Most third-party compatible APIs support /chat/completions, not Responses API.
+  provider: "openai_compatible"
   batch_size: 20
   retries: 3
+  openai_compatible:
+    base_url: "https://your-provider.example.com/v1"
+    api_key_env: "THIRD_PARTY_API_KEY"
+    trust_env: false
+    model: "provider-text-model-name"
+    temperature: 0.1
+    timeout_seconds: 180
+    json_mode: false
   openai_responses:
     base_url: "https://your-provider.example.com/v1"
     api_key_env: "THIRD_PARTY_API_KEY"
     organization_env: ""
     project_env: ""
     trust_env: false
-    # 可以填供应商支持的 OpenAI 模型别名，或供应商自己的模型名。
-    model: "gpt-5.5"
+    model: "provider-responses-model-name"
     reasoning_effort: "high"
     max_output_tokens: 8192
     timeout_seconds: 180
 
-# 情况 B：供应商只兼容 /chat/completions。
-# 把上面的 translation.provider 改成 openai_compatible，并使用这一段。
-translation_chat_completions_fallback:
-  provider: "openai_compatible"
-  openai_compatible:
-    base_url: "https://your-provider.example.com/v1"
-    api_key_env: "THIRD_PARTY_API_KEY"
-    trust_env: false
-    model: "供应商文档中的模型名"
-    temperature: 0.1
-    timeout_seconds: 180
-    json_mode: false
+subtitles:
+  max_line_chars: 24
+  bilingual: false
+
+upload:
+  # Set to true only after biliup login and upload metadata are ready.
+  enabled: false
+  uploader: "biliup"
+  subtitle_mode: "hard_subbed"
+  biliup:
+    bin: "biliup"
+    user_cookie: "data/biliup-cookies.json"
+    line: "kodo"
+    limit: 3
+    tid: 21
+    copyright: 2
+    source_template: "{room_url}"
+    tags:
+      - "SHOWROOM"
+      - "直播录像"
+    cover: ""
+    desc_format_id: 0
+    open_subtitle: true
+    subtitle_language: "zh-CN"
+    upload_subtitle_draft: false
+    extra_args: []

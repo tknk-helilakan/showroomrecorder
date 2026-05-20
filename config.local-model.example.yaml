@@ -6,14 +6,17 @@ service:
   log_level: "INFO"
 
 rooms:
+  # Replace this with your own SHOWROOM rooms and set enabled: true.
   - name: "示例房间"
-    room_id: 521297
-    url: "https://www.showroom-live.com/r/seira0605"
-    enabled: true
+    room_id: 123456
+    url: "https://www.showroom-live.com/r/example"
+    enabled: false
 
 record:
   strategy: "ffmpeg"
   min_file_size_mb: 0.1
+  # Optional test-only limit. Leave empty/null for normal full-live recording.
+  max_seconds:
 
 transcode:
   enabled: true
@@ -65,6 +68,7 @@ subtitles:
   bilingual: false
 
 upload:
+  # Set to true only after biliup login and upload metadata are ready.
   enabled: false
   uploader: "biliup"
   subtitle_mode: "hard_subbed"

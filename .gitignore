@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 data/
 config.yaml
+build/
+dist/
+.pyinstaller-home/
+wheels/
 
 # Local model files can be very large. Keep the directory placeholders,
 # but never commit downloaded ASR/translation model weights.

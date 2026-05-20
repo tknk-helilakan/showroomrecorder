@@ -159,7 +159,8 @@ class ShowroomRecorderService:
         self._append_job_event(session, "upload_file_ready", {"upload_file": str(session.upload_file)})
 
         bvid = self.uploader.upload(session, segments)
-        self._append_job_event(session, "uploaded", {"bvid": bvid})
+        event = "uploaded" if self.config.upload.enabled else "upload_skipped"
+        self._append_job_event(session, event, {"bvid": bvid})
 
     def _prepare_upload_file(self, session: LiveSession, file_stem: str) -> Path:
         if not session.mp4_file:

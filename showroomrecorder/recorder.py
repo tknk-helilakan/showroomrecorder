@@ -22,6 +22,9 @@ class StreamRecorder:
     def record(self, session: LiveSession) -> Path:
         strategy = self.config.record.strategy.lower()
         if strategy == "yt_dlp":
+            if self.config.record.max_seconds:
+                LOGGER.info("record.max_seconds is set; using ffmpeg recorder for this capture")
+                return self._record_with_ffmpeg(session)
             return self._record_with_ytdlp(session)
         if strategy == "ffmpeg":
             return self._record_with_ffmpeg(session)
@@ -62,10 +65,16 @@ class StreamRecorder:
             "-y",
             "-i",
             stream_url,
-            "-c",
-            "copy",
-            str(output_file),
         ]
+        if self.config.record.max_seconds:
+            command.extend(["-t", str(self.config.record.max_seconds)])
+        command.extend(
+            [
+                "-c",
+                "copy",
+                str(output_file),
+            ]
+        )
         self._run_record_command(command, capture_dir / "ffmpeg-record.log")
         return self._find_recorded_file(capture_dir)
 
