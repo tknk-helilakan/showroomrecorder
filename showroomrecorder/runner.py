@@ -40,7 +40,18 @@ class ShowroomRecorderService:
     async def run(self, once: bool = False) -> None:
         self._preflight()
         LOGGER.info("Watching %d SHOWROOM room(s)", len(self.config.rooms))
-        tasks = [asyncio.create_task(self._watch_room(room, once=once)) for room in self.config.rooms]
+        stagger_seconds = 0.0
+        if not once and self.config.rooms:
+            stagger_seconds = min(
+                5.0,
+                max(0.0, self.config.service.poll_interval_seconds / len(self.config.rooms)),
+            )
+        tasks = [
+            asyncio.create_task(
+                self._watch_room(room, once=once, initial_delay=index * stagger_seconds)
+            )
+            for index, room in enumerate(self.config.rooms)
+        ]
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
@@ -48,8 +59,10 @@ class ShowroomRecorderService:
             self._stop.set()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _watch_room(self, room: RoomConfig, once: bool = False) -> None:
+    async def _watch_room(self, room: RoomConfig, once: bool = False, initial_delay: float = 0.0) -> None:
         LOGGER.info("Watcher started for %s", room.name)
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
         while not self._stop.is_set():
             try:
                 status = await to_thread(self.showroom.get_live_status, room)

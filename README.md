@@ -29,6 +29,24 @@
 - `yt-dlp`，通过本项目依赖安装。
 - `biliup`，用于 Bilibili 投稿。可以按 `biliup` 官方文档安装并登录。
 
+## 版本包和打包策略
+
+Release 会提供一份默认的 Windows x64 CPU 版 zip：`showroomrecorder-windows-x64-cpu.zip`。
+
+这份包只包含程序运行时和示例配置，不包含：
+
+- 本地 ASR 模型
+- 本地翻译模型
+- `config.yaml`
+- Bilibili cookie
+- `biliup.exe`
+- FFmpeg
+- 录制和输出数据
+
+默认 Release 包面向“本地模型 + CPU 计算”的使用方式。使用者需要自己把模型下载到 `models/asr/` 和 `models/translation/`，并复制 `config.local-model.example.yaml` 为 `config.yaml` 后修改房间、模型路径、上传配置。
+
+如果要用 NVIDIA GPU/CUDA、本机特定版本的 PyTorch，或只使用 OpenAI 在线服务，建议在自己的环境里从源码运行或重新执行 `build.ps1` 打包。这样 exe 会按本机安装的依赖和 CUDA/CPU 运行时生成。
+
 ## 安装
 
 ```powershell
@@ -197,6 +215,35 @@ python -m showroomrecorder --config config.yaml
 
 说明：`faster_whisper` 的本地路径建议使用 CTranslate2/faster-whisper 格式模型目录；NLLB/M2M100 翻译模型使用 Hugging Face Transformers 格式目录。CPU 也能跑，但速度会比较慢；有 NVIDIA 显卡时建议 `device: cuda`。
 
+Release 默认 CPU 配置建议：
+
+```yaml
+asr:
+  provider: faster_whisper
+  device: "cpu"
+  compute_type: "int8"
+
+translation:
+  provider: transformers_seq2seq
+  transformers:
+    device: "cpu"
+    torch_dtype: "float32"
+    batch_size: 1
+```
+
+GPU 用户可以改成：
+
+```yaml
+asr:
+  device: "cuda"
+  compute_type: "float16"
+
+translation:
+  transformers:
+    device: "cuda"
+    torch_dtype: "float16"
+```
+
 ### 上传 Bilibili
 
 上传使用 `biliup`，配置示例：
@@ -243,3 +290,42 @@ upload:
 ```
 
 这一步依赖 Bilibili 未公开接口，可能因为账号、审核、接口变化而失败。默认 `subtitle_errors_fatal: true`，字幕上传失败会让本次任务标记为失败并保留中间文件，方便重新生成或重传；如果只想视频投稿成功即可，可以改成 `false`。
+
+## 本地打包
+
+如果你要按自己的环境生成 exe，先安装对应依赖，再运行：
+
+```powershell
+.\build.ps1
+```
+
+打包结果在：
+
+```text
+dist/showroomrecorder/showroomrecorder.exe
+```
+
+常见选择：
+
+- CPU 本地模型：安装普通 `torch` CPU 版和 `requirements-local.txt`。
+- GPU 本地模型：先安装匹配自己 CUDA 版本的 PyTorch，再安装 `requirements-local.txt`。
+- OpenAI 在线服务：只需要基础依赖和 PyInstaller，模型目录可以为空。
+
+## GitHub 自动发布
+
+仓库里的 `.github/workflows/release.yml` 会在推送 `v*` tag 时自动构建 Windows x64 CPU 版 zip，并上传到 GitHub Release。
+
+发布一个版本：
+
+```powershell
+git status
+git add .gitignore .github/workflows/release.yml README.md config.local-model.example.yaml showroomrecorder
+git commit -m "Prepare v0.1.0 release"
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin main
+git push origin v0.1.0
+```
+
+推送 tag 后，到 GitHub 的 Actions 页面等 `Build Windows CPU Release` 完成。成功后，Release 页面会出现 `showroomrecorder-windows-x64-cpu.zip`。
+
+如果只是想生成 Actions Artifact 而不发 tag，可以在 GitHub Actions 页面手动运行 `workflow_dispatch`。

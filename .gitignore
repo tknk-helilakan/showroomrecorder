@@ -11,6 +11,7 @@ dist-latest/
 .pyinstaller-home/
 wheels/
 qrcode.png
+tools/biliup/
 
 # Local model files can be very large. Keep the directory placeholders,
 # but never commit downloaded ASR/translation model weights.

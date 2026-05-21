@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -27,6 +28,10 @@ class ShowroomClient:
     def __init__(self, timeout_seconds: int = 15) -> None:
         self.timeout_seconds = timeout_seconds
         self._local = threading.local()
+        self._warning_lock = threading.Lock()
+        self._last_warning_at: dict[tuple[str, str], float] = {}
+        self._failure_counts: dict[tuple[str, str], int] = {}
+        self._warning_interval_seconds = 300.0
         self._headers = (
             {
                 "User-Agent": (
@@ -47,6 +52,12 @@ class ShowroomClient:
             session.headers.update(self._headers)
             self._local.session = session
         return session
+
+    def reset_session(self) -> None:
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            session.close()
+        self._local.session = None
 
     def ensure_room_id(self, room: RoomConfig) -> int:
         if room.room_id is not None:
@@ -80,23 +91,26 @@ class ShowroomClient:
     def get_live_status(self, room: RoomConfig) -> LiveStatus:
         room_id = self.ensure_room_id(room)
         raw: dict[str, Any] = {}
-        profile: dict[str, Any] = {}
 
         try:
             profile = self._get_json("/api/room/profile", {"room_id": room_id})
+            self._clear_request_failure("profile", room.name)
         except requests.RequestException as exc:
-            LOGGER.warning("SHOWROOM profile request failed for %s: %s", room.name, exc)
+            self._log_request_failure("profile", room.name, exc)
+            return LiveStatus(is_live=False, raw={})
 
-        try:
-            raw = self._get_json("/api/room/is_live", {"room_id": room_id})
-        except requests.HTTPError as exc:
-            response = exc.response
-            if response is None or response.status_code != 404:
-                LOGGER.warning("SHOWROOM is_live request failed for %s: %s", room.name, exc)
-            else:
-                LOGGER.debug("SHOWROOM is_live endpoint returned 404 for %s; profile fallback is used", room.name)
-        except requests.RequestException as exc:
-            LOGGER.warning("SHOWROOM is_live request failed for %s: %s", room.name, exc)
+        if "is_onlive" not in profile:
+            try:
+                raw = self._get_json("/api/room/is_live", {"room_id": room_id})
+                self._clear_request_failure("is_live", room.name)
+            except requests.HTTPError as exc:
+                response = exc.response
+                if response is None or response.status_code != 404:
+                    self._log_request_failure("is_live", room.name, exc)
+                else:
+                    LOGGER.debug("SHOWROOM is_live endpoint returned 404 for %s; profile fallback is used", room.name)
+            except requests.RequestException as exc:
+                self._log_request_failure("is_live", room.name, exc)
 
         is_live = bool(
             profile.get("is_onlive") is True
@@ -135,12 +149,48 @@ class ShowroomClient:
 
     def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.BASE}{path}"
-        response = self.session.get(url, params=params, timeout=self.timeout_seconds)
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError(f"Unexpected SHOWROOM API response from {url}: {type(data)!r}")
-        return data
+        last_error: requests.RequestException | None = None
+        for attempt in range(2):
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout_seconds)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError(f"Unexpected SHOWROOM API response from {url}: {type(data)!r}")
+                return data
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code is not None and status_code < 500:
+                    raise
+                last_error = exc
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_error = exc
+                self.reset_session()
+            if attempt == 0:
+                time.sleep(1.0)
+        assert last_error is not None
+        raise last_error
+
+    def _log_request_failure(self, kind: str, room_name: str, exc: requests.RequestException) -> None:
+        key = (kind, room_name)
+        now = time.monotonic()
+        with self._warning_lock:
+            failure_count = self._failure_counts.get(key, 0) + 1
+            self._failure_counts[key] = failure_count
+            last_warning = self._last_warning_at.get(key, 0.0)
+            should_warn = failure_count >= 3 and now - last_warning >= self._warning_interval_seconds
+            if should_warn:
+                self._last_warning_at[key] = now
+        message = "SHOWROOM %s request failed for %s after %d consecutive failed poll(s): %s"
+        if should_warn:
+            LOGGER.warning(message, kind, room_name, failure_count, exc)
+        else:
+            LOGGER.debug(message, kind, room_name, failure_count, exc)
+
+    def _clear_request_failure(self, kind: str, room_name: str) -> None:
+        key = (kind, room_name)
+        with self._warning_lock:
+            self._failure_counts.pop(key, None)
 
     def _collect_urls(self, value: Any, output: list[str]) -> None:
         if isinstance(value, str) and value.startswith(("http://", "https://")):

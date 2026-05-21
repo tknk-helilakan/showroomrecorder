@@ -1,0 +1,89 @@
+name: Build Windows CPU Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-cpu:
+    name: Windows x64 CPU
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PACKAGE_NAME: showroomrecorder-windows-x64-cpu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-local.txt
+
+      - name: Install CPU runtime dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt pyinstaller
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-local.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build executable
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path "release" $env:PACKAGE_NAME
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          Copy-Item -Path "dist\showroomrecorder\*" -Destination $packageRoot -Recurse -Force
+          Copy-Item -Path @(
+            "README.md",
+            "config.example.yaml",
+            "config.local-model.example.yaml",
+            "config.third-party.example.yaml",
+            "requirements.txt",
+            "requirements-local.txt"
+          ) -Destination $packageRoot -Force
+          New-Item -ItemType Directory -Force -Path `
+            (Join-Path $packageRoot "data"), `
+            (Join-Path $packageRoot "models\asr"), `
+            (Join-Path $packageRoot "models\translation"), `
+            (Join-Path $packageRoot "tools\biliup") | Out-Null
+          Compress-Archive -Path $packageRoot -DestinationPath "$env:PACKAGE_NAME.zip" -Force
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.PACKAGE_NAME }}.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $asset = "$env:PACKAGE_NAME.zip"
+          if (gh release view $tag *> $null) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --title $tag --generate-notes
+          }

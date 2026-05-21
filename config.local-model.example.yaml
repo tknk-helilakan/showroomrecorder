@@ -49,8 +49,8 @@ asr:
   # 可以填模型名，也可以填你下载好的本地 CTranslate2/faster-whisper 模型目录。
   # 例如："models/asr/faster-whisper-large-v3"
   model: "models/asr/faster-whisper-large-v3"
-  device: "auto"       # auto | cpu | cuda
-  compute_type: "auto" # auto | int8 | float16 | float32
+  device: "cpu"        # cpu | cuda | auto
+  compute_type: "int8" # CPU: int8. NVIDIA GPU: float16.
   normalize_audio: true
   language: "ja"
   beam_size: 5
@@ -68,9 +68,9 @@ translation:
     local_files_only: true
     source_lang: "jpn_Jpan"
     target_lang: "zho_Hans"
-    device: "auto"       # auto | cpu | cuda
-    torch_dtype: "float16"
-    batch_size: 8
+    device: "cpu"       # cpu | cuda | auto
+    torch_dtype: "float32"
+    batch_size: 1
     max_input_tokens: 256
     max_new_tokens: 160
     num_beams: 4
