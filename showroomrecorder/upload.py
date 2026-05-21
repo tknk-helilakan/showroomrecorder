@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 class BiliupUploader:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._state_lock = threading.Lock()
 
     def upload(self, session: LiveSession, segments: list[SubtitleSegment] | None = None) -> str | None:
         if not self.config.upload.enabled:
@@ -38,16 +41,57 @@ class BiliupUploader:
         if shutil.which(bin_name) is None:
             raise RuntimeError(f"biliup executable not found in PATH: {bin_name}")
 
-        upload_config = self._write_biliup_config(session)
-        command = [bin_name]
         user_cookie = biliup_cfg.get("user_cookie")
-        if user_cookie:
-            command.extend(["-u", str(self._resolve_config_path(user_cookie))])
-        command.extend(["upload", "-c", str(upload_config)])
-        command.extend(str(item) for item in biliup_cfg.get("extra_args", []))
+        mode = str(biliup_cfg.get("mode", "upload")).lower()
+        context = self._context(session)
+        part_title = render_template(
+            self.config.naming.part_title_template,
+            context,
+        )
+        subtitle_part_title: str | None = None
+        prefer_last_part = False
 
-        output = self._run(command, session.work_dir / "biliup-upload.log")
-        bvid = _extract_bvid(output)
+        if mode == "append":
+            bvid, output = self._append_with_biliup(
+                session=session,
+                bin_name=bin_name,
+                user_cookie=user_cookie,
+                part_title=part_title,
+            )
+            subtitle_part_title = part_title
+            prefer_last_part = True
+        elif mode in {"monthly", "auto_monthly", "monthly_append"}:
+            monthly_bvid = self._resolve_monthly_vid(session)
+            if monthly_bvid:
+                bvid, output = self._append_with_biliup(
+                    session=session,
+                    bin_name=bin_name,
+                    user_cookie=user_cookie,
+                    part_title=part_title,
+                    vid=monthly_bvid,
+                )
+                subtitle_part_title = part_title
+                prefer_last_part = True
+            else:
+                bvid, output = self._upload_new_with_biliup(
+                    session=session,
+                    bin_name=bin_name,
+                    user_cookie=user_cookie,
+                )
+                if not bvid:
+                    raise RuntimeError("Biliup upload succeeded but no BVID was detected; cannot remember monthly submission")
+                self._remember_monthly_vid(session, bvid)
+                subtitle_part_title = part_title
+                prefer_last_part = True
+        elif mode == "upload":
+            bvid, output = self._upload_new_with_biliup(
+                session=session,
+                bin_name=bin_name,
+                user_cookie=user_cookie,
+            )
+        else:
+            raise ValueError(f"Unsupported upload.biliup.mode: {mode}")
+
         if bvid:
             LOGGER.info("Biliup output detected BVID: %s", bvid)
             session.bvid = bvid
@@ -61,23 +105,152 @@ class BiliupUploader:
             try:
                 SubtitleDraftUploader(
                     cookie_file=self._resolve_config_path(user_cookie),
-                    language=str(biliup_cfg.get("subtitle_language", "zh-CN")),
-                ).upload(bvid, segments)
+                    language=str(biliup_cfg.get("subtitle_language", "zh")),
+                    trust_env=bool(biliup_cfg.get("trust_env", False)),
+                ).upload(
+                    bvid,
+                    segments,
+                    part_title=subtitle_part_title,
+                    prefer_last=prefer_last_part,
+                )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Bilibili subtitle draft upload failed: %s", exc)
+                if bool(biliup_cfg.get("subtitle_errors_fatal", True)):
+                    raise
         return bvid
+
+    def _upload_new_with_biliup(
+        self,
+        *,
+        session: LiveSession,
+        bin_name: str,
+        user_cookie: Any,
+    ) -> tuple[str | None, str]:
+        biliup_cfg = self.config.upload.biliup
+        upload_config = self._write_biliup_config(session)
+        command = [bin_name]
+        if user_cookie:
+            command.extend(["-u", str(self._resolve_config_path(user_cookie))])
+        command.extend(["upload", "-c", str(upload_config)])
+        command.extend(str(item) for item in biliup_cfg.get("extra_args", []))
+
+        output = self._run(command, session.work_dir / "biliup-upload.log")
+        return _extract_bvid(output), output
+
+    def _append_with_biliup(
+        self,
+        *,
+        session: LiveSession,
+        bin_name: str,
+        user_cookie: Any,
+        part_title: str,
+        vid: str | None = None,
+    ) -> tuple[str, str]:
+        cfg = self.config.upload.biliup
+        vid = vid or self._resolve_append_vid(session)
+        command = [bin_name]
+        if user_cookie:
+            command.extend(["-u", str(self._resolve_config_path(user_cookie))])
+        command.extend(["append", "--vid", vid])
+        command.extend(["--line", str(cfg.get("line", "kodo"))])
+        command.extend(["--limit", str(int(cfg.get("limit", 3)))])
+        command.extend(["--copyright", str(int(cfg.get("copyright", 2)))])
+        command.extend(["--source", render_template(str(cfg.get("source_template", "{room_url}")), self._context(session))])
+        command.extend(["--tid", str(int(cfg.get("tid", 21)))])
+        command.extend(["--cover", str(cfg.get("cover", ""))])
+        command.extend(["--title", part_title])
+        command.extend(["--desc", render_template(self.config.naming.desc_template, self._context(session))])
+        command.extend(["--dynamic", render_template(self.config.naming.dynamic_template, self._context(session))])
+        tags = cfg.get("tags", [])
+        tag_value = ",".join(str(item) for item in tags) if isinstance(tags, list) else str(tags)
+        command.extend(["--tag", tag_value])
+        command.extend(str(item) for item in cfg.get("extra_args", []))
+        command.append(str(session.upload_file))
+        output = self._run(command, session.work_dir / "biliup-append.log")
+        return vid, output
+
+    def _resolve_append_vid(self, session: LiveSession) -> str:
+        vid = self._resolve_append_vid_optional(session)
+        if vid:
+            return vid
+        raise RuntimeError(
+            "upload.biliup.mode is append, but append_vid or append_vids is not configured"
+        )
+
+    def _resolve_append_vid_optional(self, session: LiveSession) -> str | None:
+        cfg = self.config.upload.biliup
+        mappings = cfg.get("append_vids") or {}
+        if isinstance(mappings, dict):
+            for key in (session.room.name, str(session.room.room_id or "")):
+                value = mappings.get(key)
+                if value:
+                    return str(value)
+        vid = cfg.get("append_vid") or cfg.get("vid")
+        if vid:
+            return str(vid)
+        return None
+
+    def _resolve_monthly_vid(self, session: LiveSession) -> str | None:
+        manual_vid = self._resolve_append_vid_optional(session)
+        if manual_vid:
+            return manual_vid
+        with self._state_lock:
+            state = self._load_monthly_state()
+        key = self._monthly_key(session)
+        item = (state.get("items") or {}).get(key)
+        if isinstance(item, dict) and item.get("bvid"):
+            return str(item["bvid"])
+        if isinstance(item, str) and item:
+            return item
+        return None
+
+    def _remember_monthly_vid(self, session: LiveSession, bvid: str) -> None:
+        with self._state_lock:
+            state = self._load_monthly_state()
+            items = state.setdefault("items", {})
+            items[self._monthly_key(session)] = {
+                "bvid": bvid,
+                "streamer": session.room.name,
+                "room_id": session.room.room_id,
+                "month": f"{session.started_at:%Y%m}",
+                "title": render_template(self.config.naming.title_template, self._context(session)),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self._save_monthly_state(state)
+        LOGGER.info("Remembered monthly BVID for %s: %s", session.room.name, bvid)
+
+    def _monthly_key(self, session: LiveSession) -> str:
+        template = str(self.config.upload.biliup.get("monthly_key_template", "{streamer}:{started_at:%Y%m}"))
+        return render_template(template, self._context(session))
+
+    def _monthly_state_path(self) -> Path:
+        value = self.config.upload.biliup.get("monthly_state_file")
+        if value:
+            return self._resolve_config_path(value)
+        return self.config.paths.data_dir / "biliup-monthly.json"
+
+    def _load_monthly_state(self) -> dict[str, Any]:
+        path = self._monthly_state_path()
+        if not path.exists():
+            return {"version": 1, "items": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Could not parse monthly state file: {path}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Monthly state file must contain a JSON object: {path}")
+        data.setdefault("version", 1)
+        data.setdefault("items", {})
+        return data
+
+    def _save_monthly_state(self, state: dict[str, Any]) -> None:
+        path = self._monthly_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _write_biliup_config(self, session: LiveSession) -> Path:
         cfg = self.config.upload.biliup
-        context = build_context(
-            streamer=session.room.name,
-            room_url=session.room.url,
-            room_id=session.room.room_id,
-            title=session.live_title,
-            started_at=session.started_at,
-            ended_at=session.ended_at,
-            job_id=session.job_id,
-        )
+        context = self._context(session)
         title = render_template(self.config.naming.title_template, context)
         desc = render_template(self.config.naming.desc_template, context)
         dynamic = render_template(self.config.naming.dynamic_template, context)
@@ -102,7 +275,7 @@ class BiliupUploader:
             "open_subtitle": bool(cfg.get("open_subtitle", True)),
             "subtitle": {
                 "open": 1 if cfg.get("open_subtitle", True) else 0,
-                "lan": str(cfg.get("subtitle_language", "zh-CN")),
+                "lan": str(cfg.get("subtitle_language", "zh")),
             },
         }
         payload = {
@@ -113,6 +286,17 @@ class BiliupUploader:
         path = session.work_dir / "biliup-upload.yaml"
         path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return path
+
+    def _context(self, session: LiveSession) -> dict[str, Any]:
+        return build_context(
+            streamer=session.room.name,
+            room_url=session.room.url,
+            room_id=session.room.room_id,
+            title=session.live_title,
+            started_at=session.started_at,
+            ended_at=session.ended_at,
+            job_id=session.job_id,
+        )
 
     def _run(self, command: list[str], log_file: Path) -> str:
         LOGGER.info("Starting upload command: %s", " ".join(command))
@@ -150,11 +334,13 @@ class BiliupUploader:
 class SubtitleDraftUploader:
     ENDPOINT = "https://api.bilibili.com/x/v2/dm/subtitle/draft/save"
     PAGELIST = "https://api.bilibili.com/x/player/pagelist"
+    VIEW = "https://api.bilibili.com/x/web-interface/view"
 
-    def __init__(self, cookie_file: Path, language: str = "zh-CN") -> None:
+    def __init__(self, cookie_file: Path, language: str = "zh", trust_env: bool = False) -> None:
         self.cookie_file = cookie_file
         self.language = language
         self.session = requests.Session()
+        self.session.trust_env = trust_env
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -166,8 +352,17 @@ class SubtitleDraftUploader:
         )
         self._load_cookies()
 
-    def upload(self, bvid: str, segments: list[SubtitleSegment]) -> None:
-        cid = self._get_cid(bvid)
+    def upload(
+        self,
+        bvid: str,
+        segments: list[SubtitleSegment],
+        *,
+        part_title: str | None = None,
+        prefer_last: bool = False,
+    ) -> None:
+        page = self._get_page(bvid, part_title=part_title, prefer_last=prefer_last)
+        cid = int(page["cid"])
+        aid = int(page["aid"])
         csrf = self.session.cookies.get("bili_jct")
         if not csrf:
             raise RuntimeError("Cookie does not contain bili_jct csrf token")
@@ -175,9 +370,12 @@ class SubtitleDraftUploader:
         response = self.session.post(
             self.ENDPOINT,
             data={
+                "aid": aid,
+                "bvid": bvid,
                 "type": 1,
                 "oid": cid,
                 "lan": self.language,
+                "sign": "false",
                 "data": json.dumps(data, ensure_ascii=False),
                 "submit": "true",
                 "csrf": csrf,
@@ -190,13 +388,25 @@ class SubtitleDraftUploader:
             raise RuntimeError(f"Bilibili subtitle API returned: {payload}")
         LOGGER.info("Bilibili subtitle draft uploaded for %s cid=%s", bvid, cid)
 
-    def _get_cid(self, bvid: str) -> int:
-        response = self.session.get(self.PAGELIST, params={"bvid": bvid}, timeout=30)
+    def _get_cid(self, bvid: str, *, part_title: str | None = None, prefer_last: bool = False) -> int:
+        return int(self._get_page(bvid, part_title=part_title, prefer_last=prefer_last)["cid"])
+
+    def _get_page(self, bvid: str, *, part_title: str | None = None, prefer_last: bool = False) -> dict[str, Any]:
+        response = self.session.get(self.VIEW, params={"bvid": bvid}, timeout=30)
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 0 or not payload.get("data"):
-            raise RuntimeError(f"Could not fetch cid for {bvid}: {payload}")
-        return int(payload["data"][0]["cid"])
+        data = payload.get("data") or {}
+        pages = data.get("pages") or []
+        aid = data.get("aid")
+        if payload.get("code") != 0 or not pages or not aid:
+            raise RuntimeError(f"Could not fetch page info for {bvid}: {payload}")
+        if part_title:
+            for page in pages:
+                if str(page.get("part", "")).strip() == part_title.strip():
+                    return {**page, "aid": aid}
+            LOGGER.warning("Could not find Bilibili part title %r in %s; using %s page", part_title, bvid, "last" if prefer_last else "first")
+        selected = pages[-1] if prefer_last else pages[0]
+        return {**selected, "aid": aid}
 
     def _load_cookies(self) -> None:
         if not self.cookie_file.exists():

@@ -17,6 +17,8 @@
   - `none`：不翻译，只保留日语字幕。
 - 支持把中文字幕硬压进 MP4 后上传，或只上传无硬字幕 MP4 并保留字幕文件。
 - 上传通过 `biliup` 命令行完成，并可选尝试调用 Bilibili 字幕草稿接口上传字幕。
+- 支持按月合集投稿：本月第一次自动新投稿，后续直播自动追加分 P。
+- 可配置上传成功后只保留最终上传用 MP4 和字幕文件，清理中间产物。
 
 请只录制和上传你有权处理的直播内容，并遵守 SHOWROOM 与 Bilibili 的平台规则。
 
@@ -203,12 +205,32 @@ python -m showroomrecorder --config config.yaml
 upload:
   enabled: true
   uploader: biliup
+  subtitle_mode: sidecar
+  cleanup_after_success: true
+  keep_latest_upload_per_room: true
   biliup:
+    mode: monthly
     bin: biliup
     user_cookie: "data/biliup-cookies.json"
+    subtitle_language: zh
+    upload_subtitle_draft: true
 ```
 
 默认 `subtitle_mode: hard_subbed`，会先生成一个硬字幕 MP4 再投稿，避免 B 站字幕上传接口变化导致字幕不可见。生成的 `.zh.srt` 仍会保留在本地。
+
+`biliup.mode` 可选：
+
+- `upload`：每次都新建投稿。
+- `append`：追加到 `append_vid` 或 `append_vids` 指定的已有投稿。
+- `monthly`：按 `monthly_key_template` 区分主播和月份；第一次新建投稿并把 BVID 写入 `data/biliup-monthly.json`，之后自动追加分 P。
+
+按月合集可以这样命名：
+
+```yaml
+naming:
+  title_template: "【高嶺のなでしこ-{streamer}】{started_at:%Y%m} showroom 直播合集"
+  part_title_template: "{started_at:%Y%m%d} showroom 直播"
+```
 
 如果想尝试上传 B 站字幕草稿：
 
@@ -216,6 +238,8 @@ upload:
 upload:
   biliup:
     upload_subtitle_draft: true
+    subtitle_language: zh
+    subtitle_errors_fatal: true
 ```
 
-这一步依赖 Bilibili 未公开接口，可能因为账号、审核、接口变化而失败；失败不会影响视频投稿。
+这一步依赖 Bilibili 未公开接口，可能因为账号、审核、接口变化而失败。默认 `subtitle_errors_fatal: true`，字幕上传失败会让本次任务标记为失败并保留中间文件，方便重新生成或重传；如果只想视频投稿成功即可，可以改成 `false`。

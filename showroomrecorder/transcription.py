@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 def create_transcriber(config: AsrConfig, ffmpeg_bin: str):
     if config.provider in {"openai", "openai_compatible"}:
         return OpenAITranscriber(config, ffmpeg_bin=ffmpeg_bin)
-    return FasterWhisperTranscriber(config)
+    return FasterWhisperTranscriber(config, ffmpeg_bin=ffmpeg_bin)
 
 
 class OpenAITranscriber:
@@ -260,17 +260,19 @@ class OpenAITranscriber:
 
 
 class FasterWhisperTranscriber:
-    def __init__(self, config: AsrConfig) -> None:
+    def __init__(self, config: AsrConfig, ffmpeg_bin: str = "ffmpeg") -> None:
         self.config = config
+        self.ffmpeg_bin = ffmpeg_bin
         self._model = None
 
     def transcribe(self, media_file: Path) -> list[SubtitleSegment]:
         if self.config.provider != "faster_whisper":
             raise ValueError(f"Unsupported ASR provider: {self.config.provider}")
         model = self._load_model()
-        LOGGER.info("Starting ASR with faster-whisper model=%s file=%s", self.config.model, media_file)
+        input_file = self._prepare_audio(media_file) if self.config.normalize_audio else media_file
+        LOGGER.info("Starting ASR with faster-whisper model=%s file=%s", self.config.model, input_file)
         segments_iter, info = model.transcribe(
-            str(media_file),
+            str(input_file),
             language=self.config.language,
             beam_size=self.config.beam_size,
             vad_filter=self.config.vad_filter,
@@ -296,6 +298,37 @@ class FasterWhisperTranscriber:
             )
         LOGGER.info("ASR produced %d subtitle segments", len(segments))
         return segments
+
+    def _prepare_audio(self, media_file: Path) -> Path:
+        audio_file = media_file.parent / f"{media_file.stem}.asr.wav"
+        command = [
+            self.ffmpeg_bin,
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(media_file),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-af",
+            "aresample=async=1:first_pts=0",
+            str(audio_file),
+        ]
+        log_file = audio_file.with_suffix(".asr-ffmpeg.log")
+        LOGGER.info("Preparing timestamp-aligned ASR audio: %s", audio_file)
+        with log_file.open("w", encoding="utf-8") as log:
+            process = subprocess.run(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        if process.returncode != 0:
+            raise RuntimeError(f"ASR audio preparation failed with exit code {process.returncode}. See log: {log_file}")
+        return audio_file
 
     def _load_model(self):
         if self._model is not None:

@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 from datetime import datetime
+from pathlib import Path
 
 from .compat import ZoneInfo, to_thread
 from .config import AppConfig, RoomConfig
@@ -161,23 +162,101 @@ class ShowroomRecorderService:
         bvid = self.uploader.upload(session, segments)
         event = "uploaded" if self.config.upload.enabled else "upload_skipped"
         self._append_job_event(session, event, {"bvid": bvid})
+        if self.config.upload.enabled and bvid and self.config.upload.cleanup_after_success:
+            removed_paths = self._cleanup_after_success(session, file_stem)
+            self._append_job_event(session, "cleanup_done", {"removed_paths": removed_paths})
 
     def _prepare_upload_file(self, session: LiveSession, file_stem: str) -> Path:
         if not session.mp4_file:
             raise RuntimeError("Missing mp4 file")
         mode = self.config.upload.subtitle_mode
+        upload_stem = self._upload_file_stem(session, file_stem)
         upload_dir = self.config.paths.upload_dir / slugify(session.room.name)
         upload_dir.mkdir(parents=True, exist_ok=True)
 
         if mode == "hard_subbed" and session.zh_srt_file:
-            output_file = unique_path(upload_dir, f"{file_stem}.hardsub", ".mp4")
+            output_file = unique_path(upload_dir, f"{upload_stem}.hardsub", ".mp4")
             return self.media.burn_subtitles(session.mp4_file, session.zh_srt_file, output_file)
 
-        output_file = unique_path(upload_dir, file_stem, ".mp4")
+        output_file = unique_path(upload_dir, upload_stem, ".mp4")
         shutil.copy2(session.mp4_file, output_file)
         if mode == "sidecar" and session.zh_srt_file:
             shutil.copy2(session.zh_srt_file, output_file.with_suffix(".zh.srt"))
         return output_file
+
+    def _upload_file_stem(self, session: LiveSession, fallback: str) -> str:
+        upload_mode = str(self.config.upload.biliup.get("mode", "upload")).lower()
+        if upload_mode in {"append", "monthly", "auto_monthly", "monthly_append"}:
+            context = build_context(
+                streamer=session.room.name,
+                room_url=session.room.url,
+                room_id=session.room.room_id,
+                title=session.live_title,
+                started_at=session.started_at,
+                ended_at=session.ended_at,
+                job_id=session.job_id,
+            )
+            return slugify(render_template(self.config.naming.part_title_template, context))
+        return fallback
+
+    def _cleanup_after_success(self, session: LiveSession, file_stem: str) -> list[str]:
+        keep: set[Path] = set()
+        removed: list[str] = []
+
+        def remember_keep(path: Path | None) -> None:
+            if path and path.exists():
+                keep.add(path.resolve())
+
+        remember_keep(session.upload_file)
+        if session.upload_file:
+            remember_keep(session.upload_file.with_suffix(".zh.srt"))
+
+        candidates: list[Path] = []
+        for path in (session.raw_file, session.mp4_file, session.ja_srt_file, session.zh_srt_file):
+            if path:
+                candidates.append(path)
+        if session.mp4_file:
+            candidates.extend(session.mp4_file.parent.glob(f"{session.mp4_file.stem}.asr*"))
+        subtitle_dir = self.config.paths.subtitles_dir / slugify(session.room.name)
+        candidates.extend(subtitle_dir.glob(f"{file_stem}*"))
+        candidates.append(session.work_dir)
+
+        for path in candidates:
+            removed.extend(self._remove_cleanup_path(path, keep))
+
+        if self.config.upload.keep_latest_upload_per_room and session.upload_file:
+            upload_dir = session.upload_file.parent
+            for path in upload_dir.iterdir():
+                removed.extend(self._remove_cleanup_path(path, keep))
+
+        LOGGER.info("Cleanup after successful upload removed %d path(s)", len(removed))
+        return removed
+
+    def _remove_cleanup_path(self, path: Path, keep: set[Path]) -> list[str]:
+        if not path.exists():
+            return []
+        resolved = path.resolve()
+        if resolved in keep:
+            return []
+        if not self._is_under_data_dir(resolved):
+            LOGGER.warning("Skipping cleanup outside data_dir: %s", resolved)
+            return []
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            LOGGER.warning("Cleanup failed for %s: %s", path, exc)
+            return []
+        return [str(resolved)]
+
+    def _is_under_data_dir(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.config.paths.data_dir.resolve())
+            return True
+        except ValueError:
+            return False
 
     def _preflight(self) -> None:
         if self.config.record.strategy == "yt_dlp":

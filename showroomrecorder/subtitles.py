@@ -81,21 +81,53 @@ def write_transcript_json(path: Path, segments: list[SubtitleSegment]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+BILIBILI_MAX_CONTENT_CHARS = 80
+BILIBILI_MAX_DURATION_SECONDS = 10.0
+
+
+def _split_bilibili_text(text: str, max_chars: int = BILIBILI_MAX_CONTENT_CHARS) -> list[str]:
+    text = clean_subtitle_text(text)
+    if not text:
+        return []
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    return [text[index : index + max_chars] for index in range(0, len(text), max_chars)]
+
+
+def _bilibili_subtitle_entries(segment: SubtitleSegment) -> list[dict]:
+    content = segment.translation or segment.text
+    chunks = _split_bilibili_text(content)
+    if not chunks:
+        return []
+
+    start = max(0.0, float(segment.start))
+    end = max(start + 0.2, float(segment.end))
+    duration = min(end - start, BILIBILI_MAX_DURATION_SECONDS * len(chunks))
+
+    entries: list[dict] = []
+    for index, chunk in enumerate(chunks):
+        chunk_start = start + duration * index / len(chunks)
+        chunk_end = start + duration * (index + 1) / len(chunks)
+        entries.append(
+            {
+                "from": round(chunk_start, 3),
+                "to": round(chunk_end, 3),
+                "location": 2,
+                "content": chunk,
+            }
+        )
+    return entries
+
+
 def to_bilibili_subtitle_json(segments: list[SubtitleSegment]) -> dict:
+    body: list[dict] = []
+    for item in segments:
+        body.extend(_bilibili_subtitle_entries(item))
     return {
         "font_size": 0.4,
         "font_color": "#FFFFFF",
         "background_alpha": 0.5,
         "background_color": "#9C27B0",
         "Stroke": "none",
-        "body": [
-            {
-                "from": round(item.start, 3),
-                "to": round(item.end, 3),
-                "location": 2,
-                "content": item.translation or item.text,
-            }
-            for item in segments
-            if (item.translation or item.text).strip()
-        ],
+        "body": body,
     }

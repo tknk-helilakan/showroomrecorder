@@ -6,8 +6,11 @@ data/
 config.yaml
 build/
 dist/
+build-latest/
+dist-latest/
 .pyinstaller-home/
 wheels/
+qrcode.png
 
 # Local model files can be very large. Keep the directory placeholders,
 # but never commit downloaded ASR/translation model weights.

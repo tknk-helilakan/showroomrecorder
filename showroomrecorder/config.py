@@ -41,6 +41,7 @@ class RoomConfig:
 @dataclass
 class NamingConfig:
     filename_template: str = "{streamer}_{started_at:%Y%m%d_%H%M%S}_{title_slug}"
+    part_title_template: str = "{started_at:%Y%m%d} showroom 直播"
     title_template: str = "【{streamer}】SHOWROOM直播录像 {started_at:%Y-%m-%d %H:%M}"
     desc_template: str = "自动录制的 SHOWROOM 直播录像。"
     dynamic_template: str = "{streamer} SHOWROOM直播录像"
@@ -96,6 +97,7 @@ class AsrConfig:
     language: str = "ja"
     beam_size: int = 5
     vad_filter: bool = True
+    normalize_audio: bool = True
 
 
 @dataclass
@@ -123,6 +125,8 @@ class UploadConfig:
     enabled: bool = False
     uploader: str = "biliup"
     subtitle_mode: str = "hard_subbed"
+    cleanup_after_success: bool = False
+    keep_latest_upload_per_room: bool = False
     biliup: dict[str, Any] = field(default_factory=dict)
 
 

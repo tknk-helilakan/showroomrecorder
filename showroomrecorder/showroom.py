@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -25,9 +26,8 @@ class ShowroomClient:
 
     def __init__(self, timeout_seconds: int = 15) -> None:
         self.timeout_seconds = timeout_seconds
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.headers.update(
+        self._local = threading.local()
+        self._headers = (
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -37,6 +37,16 @@ class ShowroomClient:
                 "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
             }
         )
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.trust_env = False
+            session.headers.update(self._headers)
+            self._local.session = session
+        return session
 
     def ensure_room_id(self, room: RoomConfig) -> int:
         if room.room_id is not None:

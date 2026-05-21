@@ -16,6 +16,7 @@ rooms:
 naming:
   filename_template: "{streamer}_{started_at:%Y%m%d_%H%M%S}_{title_slug}"
   title_template: "【{streamer}】SHOWROOM直播录像 {started_at:%Y-%m-%d %H:%M}"
+  part_title_template: "{started_at:%Y%m%d} showroom 直播"
   desc_template: |
     自动录制的 SHOWROOM 直播录像。
     主播：{streamer}
@@ -65,6 +66,7 @@ asr:
   response_format: "diarized_json"
   chunking_strategy: "auto"
   prompt: ""
+  normalize_audio: true
 
 translation:
   enabled: true
@@ -119,7 +121,15 @@ upload:
   enabled: false
   uploader: "biliup"
   subtitle_mode: "hard_subbed" # hard_subbed | sidecar | none
+  cleanup_after_success: false
+  keep_latest_upload_per_room: false
   biliup:
+    mode: "upload" # upload | append | monthly
+    append_vid: ""
+    append_vids: {}
+    monthly_state_file: "data/biliup-monthly.json"
+    monthly_key_template: "{streamer}:{started_at:%Y%m}"
+    trust_env: false
     bin: "biliup"
     user_cookie: "data/biliup-cookies.json"
     line: "kodo"
@@ -133,6 +143,7 @@ upload:
     cover: ""
     desc_format_id: 0
     open_subtitle: true
-    subtitle_language: "zh-CN"
+    subtitle_language: "zh"
     upload_subtitle_draft: false
+    subtitle_errors_fatal: true
     extra_args: []
