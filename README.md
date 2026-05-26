@@ -261,6 +261,8 @@ upload:
     user_cookie: "data/biliup-cookies.json"
     subtitle_language: zh
     upload_subtitle_draft: true
+    subtitle_page_wait_seconds: 900
+    subtitle_page_poll_seconds: 30
 ```
 
 默认 `subtitle_mode: hard_subbed`，会先生成一个硬字幕 MP4 再投稿，避免 B 站字幕上传接口变化导致字幕不可见。生成的 `.zh.srt` 仍会保留在本地。
@@ -286,6 +288,8 @@ upload:
   biliup:
     upload_subtitle_draft: true
     subtitle_language: zh
+    subtitle_page_wait_seconds: 900
+    subtitle_page_poll_seconds: 30
     subtitle_errors_fatal: true
 ```
 

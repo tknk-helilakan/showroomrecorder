@@ -8,6 +8,8 @@ from .config import load_config
 from .logging_setup import setup_logging
 from .runner import ShowroomRecorderService
 
+DEFAULT_CONFIG = r"E:\helilokan\Test\showroomrecord\config.yaml"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -17,8 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-c",
         "--config",
-        default="config.yaml",
-        help="Path to the YAML config file. Defaults to config.yaml.",
+        default=DEFAULT_CONFIG,
+        help=f"Path to the YAML config file. Defaults to {DEFAULT_CONFIG}.",
     )
     parser.add_argument(
         "--once",

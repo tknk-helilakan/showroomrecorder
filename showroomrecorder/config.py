@@ -11,7 +11,9 @@ import yaml
 class ServiceConfig:
     timezone: str = "Asia/Shanghai"
     poll_interval_seconds: int = 30
+    status_parallelism: int = 2
     processing_parallelism: int = 1
+    record_retry_cooldown_seconds: int = 180
     data_dir: Path = Path("data")
     log_level: str = "INFO"
 
@@ -156,6 +158,10 @@ def load_config(path: Path) -> AppConfig:
     base_dir = path.parent
     service = ServiceConfig(**(raw.get("service") or {}))
     service.data_dir = _resolve_path(base_dir, service.data_dir)
+    service.poll_interval_seconds = max(1, int(service.poll_interval_seconds))
+    service.status_parallelism = max(1, int(service.status_parallelism or 1))
+    service.processing_parallelism = max(1, int(service.processing_parallelism or 1))
+    service.record_retry_cooldown_seconds = max(0, int(service.record_retry_cooldown_seconds or 0))
     paths = _build_paths(service.data_dir)
 
     rooms_raw = raw.get("rooms") or []

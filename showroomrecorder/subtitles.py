@@ -94,14 +94,20 @@ def _split_bilibili_text(text: str, max_chars: int = BILIBILI_MAX_CONTENT_CHARS)
     return [text[index : index + max_chars] for index in range(0, len(text), max_chars)]
 
 
-def _bilibili_subtitle_entries(segment: SubtitleSegment) -> list[dict]:
+def _bilibili_subtitle_entries(segment: SubtitleSegment, max_end: float | None = None) -> list[dict]:
     content = segment.translation or segment.text
     chunks = _split_bilibili_text(content)
     if not chunks:
         return []
 
     start = max(0.0, float(segment.start))
+    if max_end is not None and start >= max_end:
+        return []
     end = max(start + 0.2, float(segment.end))
+    if max_end is not None:
+        end = min(end, max_end)
+        if end <= start:
+            return []
     duration = min(end - start, BILIBILI_MAX_DURATION_SECONDS * len(chunks))
 
     entries: list[dict] = []
@@ -119,10 +125,10 @@ def _bilibili_subtitle_entries(segment: SubtitleSegment) -> list[dict]:
     return entries
 
 
-def to_bilibili_subtitle_json(segments: list[SubtitleSegment]) -> dict:
+def to_bilibili_subtitle_json(segments: list[SubtitleSegment], max_end: float | None = None) -> dict:
     body: list[dict] = []
     for item in segments:
-        body.extend(_bilibili_subtitle_entries(item))
+        body.extend(_bilibili_subtitle_entries(item, max_end=max_end))
     return {
         "font_size": 0.4,
         "font_color": "#FFFFFF",

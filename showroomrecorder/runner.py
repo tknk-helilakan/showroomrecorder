@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib.util
 import json
 import logging
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +37,11 @@ class ShowroomRecorderService:
         self.translator = Translator(config.translation)
         self.uploader = BiliupUploader(config)
         self.processing_sem = asyncio.Semaphore(max(1, config.service.processing_parallelism))
+        self.status_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, config.service.status_parallelism),
+            thread_name_prefix="showroom-status",
+        )
+        self._record_retry_after: dict[str, float] = {}
         self._stop = asyncio.Event()
 
     async def run(self, once: bool = False) -> None:
@@ -58,16 +65,28 @@ class ShowroomRecorderService:
             LOGGER.info("Stopping service")
             self._stop.set()
             await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self.status_executor.shutdown(wait=False)
 
     async def _watch_room(self, room: RoomConfig, once: bool = False, initial_delay: float = 0.0) -> None:
         LOGGER.info("Watcher started for %s", room.name)
         if initial_delay > 0:
             await asyncio.sleep(initial_delay)
         while not self._stop.is_set():
+            poll_interval = room.poll_interval_seconds or self.config.service.poll_interval_seconds
             try:
-                status = await to_thread(self.showroom.get_live_status, room)
+                status = await self._get_live_status(room)
                 if status.is_live:
-                    await self._handle_live(room, status)
+                    if self._record_retry_allowed(room):
+                        await self._handle_live(room, status)
+                        if not once:
+                            LOGGER.info(
+                                "Finished live handling for %s; watcher continues in %s second(s)",
+                                room.name,
+                                poll_interval,
+                            )
+                    else:
+                        LOGGER.debug("Skipping %s live retry during record cooldown", room.name)
                 elif once:
                     LOGGER.info("%s is not live", room.name)
                 else:
@@ -76,7 +95,7 @@ class ShowroomRecorderService:
                 LOGGER.exception("Watcher error for %s: %s", room.name, exc)
             if once:
                 break
-            await asyncio.sleep(room.poll_interval_seconds or self.config.service.poll_interval_seconds)
+            await asyncio.sleep(poll_interval)
 
     async def _handle_live(self, room: RoomConfig, status: LiveStatus) -> None:
         started_at = datetime.now(self.tz)
@@ -101,6 +120,7 @@ class ShowroomRecorderService:
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Recording failed for %s: %s", room.name, exc)
             self._append_job_event(session, "record_failed", {"error": str(exc)})
+            self._set_record_retry_cooldown(room)
             return
 
         async with self.processing_sem:
@@ -110,6 +130,28 @@ class ShowroomRecorderService:
                 LOGGER.exception("Processing failed for %s: %s", room.name, exc)
                 self._append_job_event(session, "processing_failed", {"error": str(exc)})
                 return
+
+    async def _get_live_status(self, room: RoomConfig) -> LiveStatus:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.status_executor, self.showroom.get_live_status, room)
+
+    def _room_key(self, room: RoomConfig) -> str:
+        return str(room.room_id or room.url or room.name)
+
+    def _record_retry_allowed(self, room: RoomConfig) -> bool:
+        retry_at = self._record_retry_after.get(self._room_key(room), 0.0)
+        return time.monotonic() >= retry_at
+
+    def _set_record_retry_cooldown(self, room: RoomConfig) -> None:
+        cooldown = max(0, int(self.config.service.record_retry_cooldown_seconds))
+        if cooldown <= 0:
+            return
+        self._record_retry_after[self._room_key(room)] = time.monotonic() + cooldown
+        LOGGER.warning(
+            "Recording retry for %s is cooled down for %d second(s)",
+            room.name,
+            cooldown,
+        )
 
     def _process_and_upload(self, session: LiveSession) -> None:
         if not session.raw_file:
@@ -228,7 +270,10 @@ class ShowroomRecorderService:
         for path in (session.raw_file, session.mp4_file, session.ja_srt_file, session.zh_srt_file):
             if path:
                 candidates.append(path)
+        if session.raw_file:
+            candidates.append(session.raw_file.parent)
         if session.mp4_file:
+            candidates.append(session.mp4_file.with_suffix(".ffmpeg.log"))
             candidates.extend(session.mp4_file.parent.glob(f"{session.mp4_file.stem}.asr*"))
         subtitle_dir = self.config.paths.subtitles_dir / slugify(session.room.name)
         candidates.extend(subtitle_dir.glob(f"{file_stem}*"))
@@ -241,6 +286,18 @@ class ShowroomRecorderService:
             upload_dir = session.upload_file.parent
             for path in upload_dir.iterdir():
                 removed.extend(self._remove_cleanup_path(path, keep))
+            room_slug = slugify(session.room.name)
+            for parent_dir in (
+                self.config.paths.raw_dir,
+                self.config.paths.processed_dir,
+                self.config.paths.subtitles_dir,
+                self.config.paths.work_dir,
+            ):
+                room_dir = parent_dir / room_slug
+                if not room_dir.exists():
+                    continue
+                for path in room_dir.iterdir():
+                    removed.extend(self._remove_cleanup_path(path, keep))
 
         LOGGER.info("Cleanup after successful upload removed %d path(s)", len(removed))
         return removed
@@ -288,6 +345,11 @@ class ShowroomRecorderService:
                 raise RuntimeError(
                     f"OpenAI-compatible ASR requires environment variable {self.config.asr.api_key_env}"
                 )
+        if self.config.asr.enabled and self.config.asr.provider == "faster_whisper":
+            self._assert_python_package(
+                "faster_whisper",
+                "Local ASR requires faster-whisper. Run with .\\.venv\\Scripts\\python.exe or install local model dependencies with: pip install -r requirements-local.txt",
+            )
         if self.config.translation.enabled and self.config.translation.provider == "openai_responses":
             cfg = self.config.translation.openai_responses
             api_key_env = str(cfg.get("api_key_env", "OPENAI_API_KEY"))
@@ -295,9 +357,19 @@ class ShowroomRecorderService:
                 raise RuntimeError(
                     f"OpenAI translation requires environment variable {api_key_env}"
                 )
+        if self.config.translation.enabled and self.config.translation.provider == "transformers_seq2seq":
+            for package in ("torch", "transformers"):
+                self._assert_python_package(
+                    package,
+                    "Local translation requires torch and transformers. Run with .\\.venv\\Scripts\\python.exe or install local model dependencies with: pip install -r requirements-local.txt",
+                )
         if self.config.upload.enabled:
             bin_name = str(self.config.upload.biliup.get("bin", "biliup"))
             assert_tool_available(bin_name)
+
+    def _assert_python_package(self, package: str, message: str) -> None:
+        if importlib.util.find_spec(package) is None:
+            raise RuntimeError(message)
 
     def _make_job_id(self, room: RoomConfig, started_at: datetime) -> str:
         return f"{started_at:%Y%m%d_%H%M%S}_{slugify(room.name, 40)}"

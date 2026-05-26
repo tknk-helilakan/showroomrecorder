@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,7 @@ class BiliupUploader:
             self.config.naming.part_title_template,
             context,
         )
-        subtitle_part_title: str | None = None
+        subtitle_part_titles: list[str] = []
         prefer_last_part = False
 
         if mode == "append":
@@ -58,7 +59,7 @@ class BiliupUploader:
                 user_cookie=user_cookie,
                 part_title=part_title,
             )
-            subtitle_part_title = part_title
+            subtitle_part_titles = self._subtitle_part_title_candidates(session, part_title)
             prefer_last_part = True
         elif mode in {"monthly", "auto_monthly", "monthly_append"}:
             monthly_bvid = self._resolve_monthly_vid(session)
@@ -70,7 +71,7 @@ class BiliupUploader:
                     part_title=part_title,
                     vid=monthly_bvid,
                 )
-                subtitle_part_title = part_title
+                subtitle_part_titles = self._subtitle_part_title_candidates(session, part_title)
                 prefer_last_part = True
             else:
                 bvid, output = self._upload_new_with_biliup(
@@ -81,7 +82,7 @@ class BiliupUploader:
                 if not bvid:
                     raise RuntimeError("Biliup upload succeeded but no BVID was detected; cannot remember monthly submission")
                 self._remember_monthly_vid(session, bvid)
-                subtitle_part_title = part_title
+                subtitle_part_titles = self._subtitle_part_title_candidates(session, None)
                 prefer_last_part = True
         elif mode == "upload":
             bvid, output = self._upload_new_with_biliup(
@@ -107,10 +108,12 @@ class BiliupUploader:
                     cookie_file=self._resolve_config_path(user_cookie),
                     language=str(biliup_cfg.get("subtitle_language", "zh")),
                     trust_env=bool(biliup_cfg.get("trust_env", False)),
+                    page_wait_seconds=int(biliup_cfg.get("subtitle_page_wait_seconds") or 900),
+                    page_poll_seconds=int(biliup_cfg.get("subtitle_page_poll_seconds") or 30),
                 ).upload(
                     bvid,
                     segments,
-                    part_title=subtitle_part_title,
+                    part_titles=subtitle_part_titles,
                     prefer_last=prefer_last_part,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -287,6 +290,15 @@ class BiliupUploader:
         path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return path
 
+    def _subtitle_part_title_candidates(self, session: LiveSession, part_title: str | None) -> list[str]:
+        candidates: list[str] = []
+        if session.upload_file:
+            candidates.append(session.upload_file.stem)
+        if part_title:
+            candidates.append(part_title)
+            candidates.append(part_title.replace(" ", "_"))
+        return list(dict.fromkeys(item.strip() for item in candidates if item.strip()))
+
     def _context(self, session: LiveSession) -> dict[str, Any]:
         return build_context(
             streamer=session.room.name,
@@ -336,9 +348,18 @@ class SubtitleDraftUploader:
     PAGELIST = "https://api.bilibili.com/x/player/pagelist"
     VIEW = "https://api.bilibili.com/x/web-interface/view"
 
-    def __init__(self, cookie_file: Path, language: str = "zh", trust_env: bool = False) -> None:
+    def __init__(
+        self,
+        cookie_file: Path,
+        language: str = "zh",
+        trust_env: bool = False,
+        page_wait_seconds: int = 900,
+        page_poll_seconds: int = 30,
+    ) -> None:
         self.cookie_file = cookie_file
         self.language = language
+        self.page_wait_seconds = max(0, page_wait_seconds)
+        self.page_poll_seconds = max(1, page_poll_seconds)
         self.session = requests.Session()
         self.session.trust_env = trust_env
         self.session.headers.update(
@@ -358,15 +379,16 @@ class SubtitleDraftUploader:
         segments: list[SubtitleSegment],
         *,
         part_title: str | None = None,
+        part_titles: list[str] | None = None,
         prefer_last: bool = False,
     ) -> None:
-        page = self._get_page(bvid, part_title=part_title, prefer_last=prefer_last)
+        page = self._wait_for_page(bvid, part_title=part_title, part_titles=part_titles, prefer_last=prefer_last)
         cid = int(page["cid"])
         aid = int(page["aid"])
         csrf = self.session.cookies.get("bili_jct")
         if not csrf:
             raise RuntimeError("Cookie does not contain bili_jct csrf token")
-        data = to_bilibili_subtitle_json(segments)
+        data = to_bilibili_subtitle_json(segments, max_end=_page_duration(page))
         response = self.session.post(
             self.ENDPOINT,
             data={
@@ -388,10 +410,65 @@ class SubtitleDraftUploader:
             raise RuntimeError(f"Bilibili subtitle API returned: {payload}")
         LOGGER.info("Bilibili subtitle draft uploaded for %s cid=%s", bvid, cid)
 
-    def _get_cid(self, bvid: str, *, part_title: str | None = None, prefer_last: bool = False) -> int:
-        return int(self._get_page(bvid, part_title=part_title, prefer_last=prefer_last)["cid"])
+    def _get_cid(
+        self,
+        bvid: str,
+        *,
+        part_title: str | None = None,
+        part_titles: list[str] | None = None,
+        prefer_last: bool = False,
+    ) -> int:
+        return int(
+            self._wait_for_page(
+                bvid,
+                part_title=part_title,
+                part_titles=part_titles,
+                prefer_last=prefer_last,
+            )["cid"]
+        )
 
-    def _get_page(self, bvid: str, *, part_title: str | None = None, prefer_last: bool = False) -> dict[str, Any]:
+    def _wait_for_page(
+        self,
+        bvid: str,
+        *,
+        part_title: str | None = None,
+        part_titles: list[str] | None = None,
+        prefer_last: bool = False,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.page_wait_seconds
+        last_error: Exception | None = None
+        while True:
+            try:
+                return self._get_page(
+                    bvid,
+                    part_title=part_title,
+                    part_titles=part_titles,
+                    prefer_last=prefer_last,
+                )
+            except (requests.RequestException, RuntimeError) as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                LOGGER.warning(
+                    "Bilibili page info for %s is not ready; retrying in %d second(s): %s",
+                    bvid,
+                    self.page_poll_seconds,
+                    exc,
+                )
+                time.sleep(self.page_poll_seconds)
+        assert last_error is not None
+        raise RuntimeError(
+            f"Could not fetch page info for {bvid} within {self.page_wait_seconds} second(s): {last_error}"
+        ) from last_error
+
+    def _get_page(
+        self,
+        bvid: str,
+        *,
+        part_title: str | None = None,
+        part_titles: list[str] | None = None,
+        prefer_last: bool = False,
+    ) -> dict[str, Any]:
         response = self.session.get(self.VIEW, params={"bvid": bvid}, timeout=30)
         response.raise_for_status()
         payload = response.json()
@@ -400,11 +477,29 @@ class SubtitleDraftUploader:
         aid = data.get("aid")
         if payload.get("code") != 0 or not pages or not aid:
             raise RuntimeError(f"Could not fetch page info for {bvid}: {payload}")
+        title_candidates: list[str] = []
+        if part_titles:
+            title_candidates.extend(str(item).strip() for item in part_titles if str(item).strip())
         if part_title:
-            for page in pages:
-                if str(page.get("part", "")).strip() == part_title.strip():
-                    return {**page, "aid": aid}
-            LOGGER.warning("Could not find Bilibili part title %r in %s; using %s page", part_title, bvid, "last" if prefer_last else "first")
+            title_candidates.append(part_title.strip())
+        title_candidates = list(dict.fromkeys(title_candidates))
+        if title_candidates:
+            for title in title_candidates:
+                for page in pages:
+                    if str(page.get("part", "")).strip() == title:
+                        LOGGER.info(
+                            "Matched Bilibili part title %r in %s cid=%s",
+                            title,
+                            bvid,
+                            page.get("cid"),
+                        )
+                        return {**page, "aid": aid}
+            LOGGER.warning(
+                "Could not find Bilibili part title in %s; candidates=%s; using %s page",
+                bvid,
+                title_candidates,
+                "last" if prefer_last else "first",
+            )
         selected = pages[-1] if prefer_last else pages[0]
         return {**selected, "aid": aid}
 
@@ -456,3 +551,14 @@ class SubtitleDraftUploader:
 def _extract_bvid(output: str) -> str | None:
     match = re.search(r"\bBV[0-9A-Za-z]{10,}\b", output)
     return match.group(0) if match else None
+
+
+def _page_duration(page: dict[str, Any]) -> float | None:
+    value = page.get("duration")
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None

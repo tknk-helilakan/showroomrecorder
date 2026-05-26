@@ -1,7 +1,9 @@
 service:
   timezone: "Asia/Shanghai"
   poll_interval_seconds: 30
+  status_parallelism: 2
   processing_parallelism: 1
+  record_retry_cooldown_seconds: 180
   data_dir: "data"
   log_level: "INFO"
 
@@ -145,5 +147,7 @@ upload:
     open_subtitle: true
     subtitle_language: "zh"
     upload_subtitle_draft: false
+    subtitle_page_wait_seconds: 900
+    subtitle_page_poll_seconds: 30
     subtitle_errors_fatal: true
     extra_args: []
