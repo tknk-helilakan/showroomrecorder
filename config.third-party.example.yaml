@@ -100,6 +100,24 @@ subtitles:
   max_line_chars: 24
   bilingual: false
 
+danmaku:
+  enabled: false
+  burn_in: true
+  poll_seconds: 2
+  request_timeout_seconds: 10
+  display_seconds: 14
+  max_entries: 20000
+  max_text_chars: 80
+  max_user_name_chars: 16
+  lane_count: 12
+  font_name: "Microsoft YaHei"
+  font_size: 32
+  font_opacity: 0.6
+  top_margin: 24
+  bottom_margin: 140
+  include_user_name: true
+  include_system_messages: false
+
 upload:
   # Set to true only after biliup login and upload metadata are ready.
   enabled: false

@@ -63,6 +63,13 @@ class StreamRecorder:
             self.config.transcode.ffmpeg_bin,
             "-hide_banner",
             "-y",
+            "-user_agent",
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "-headers",
+            "Referer: https://www.showroom-live.com/\r\nOrigin: https://www.showroom-live.com\r\n",
             "-i",
             stream_url,
         ]
@@ -125,6 +132,13 @@ class StreamRecorder:
 
     def _choose_stream_url(self, urls: list[str]) -> str:
         hls = [url for url in urls if ".m3u8" in url or "hls" in url.lower()]
+        for marker in ("_main_mm.m3u8", "_main_ll.m3u8", "_main_ss.m3u8"):
+            for url in hls:
+                if marker in url:
+                    return url
+        concrete_hls = [url for url in hls if "_abr" not in url]
+        if concrete_hls:
+            return concrete_hls[0]
         return hls[0] if hls else urls[0]
 
     def _yt_dlp_command_prefix(self, bin_name: str) -> list[str]:

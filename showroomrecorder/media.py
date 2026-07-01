@@ -14,9 +14,9 @@ class MediaProcessor:
     def __init__(self, config: TranscodeConfig) -> None:
         self.config = config
 
-    def transcode(self, input_file: Path, output_file: Path) -> Path:
+    def transcode(self, input_file: Path, output_file: Path, danmaku_file: Path | None = None) -> Path:
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        vf = self._video_filter()
+        vf = self._video_filter(danmaku_file=danmaku_file)
         command = [
             self.config.ffmpeg_bin,
             "-hide_banner",
@@ -77,8 +77,8 @@ class MediaProcessor:
         _run(command, output_file.with_suffix(".hardsub.log"))
         return output_file
 
-    def _video_filter(self) -> str:
-        filters: list[str] = []
+    def _video_filter(self, danmaku_file: Path | None = None) -> str:
+        filters: list[str] = ["setpts=PTS-STARTPTS"]
         width = self.config.width
         height = self.config.height
         if width and height:
@@ -98,6 +98,8 @@ class MediaProcessor:
                 raise ValueError(f"Unsupported transcode.scale_mode: {self.config.scale_mode}")
         if self.config.fps:
             filters.append(f"fps={self.config.fps}")
+        if danmaku_file and danmaku_file.exists():
+            filters.append(f"subtitles={_escape_subtitle_path(danmaku_file)}")
         filters.append("format=yuv420p")
         return ",".join(filters)
 
@@ -135,4 +137,3 @@ def _escape_subtitle_path(path: Path) -> str:
     value = value.replace(":", r"\:")
     value = value.replace("'", r"\'")
     return f"'{value}'"
-

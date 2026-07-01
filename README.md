@@ -7,6 +7,7 @@
 - 轮询 SHOWROOM 直播间开播状态。
 - 开播后调用 `yt-dlp` 录制直播流到本地。
 - 调用 `ffmpeg` 转码为指定帧率和分辨率的 MP4。
+- 可选捕获 SHOWROOM 弹幕，保存 `.danmaku.ass` / `.danmaku.jsonl`，并在转码时同步烧进画面。
 - 调用 OpenAI Audio transcription API 做日语语音识别，生成 `.ja.srt`。
 - 支持多种翻译后端生成 `.zh.srt`：
   - `openai_responses`：OpenAI Responses API，默认准确率优先。
@@ -91,6 +92,7 @@ python -m showroomrecorder --config config.yaml
 - `raw`：原始录制文件。
 - `processed`：转码后的 MP4。
 - `subtitles`：日语和中文字幕。
+- `danmaku`：弹幕 JSONL 和 ASS 文件。
 - `upload`：最终上传用视频。
 - `jobs.jsonl`：任务流水日志。
 
@@ -101,6 +103,7 @@ python -m showroomrecorder --config config.yaml
 录制结束后，任务会进入处理队列，按顺序执行：
 
 - 转码 MP4
+- 如果启用弹幕烧录，转码时把 `.danmaku.ass` 同步显示在画面中
 - 日语语音识别
 - 翻译中文字幕并生成字幕文件
 - 准备上传视频
@@ -243,6 +246,26 @@ translation:
     device: "cuda"
     torch_dtype: "float16"
 ```
+
+### 弹幕捕获和烧录
+
+启用后，录制直播的同时会轮询 SHOWROOM 的 `comment_log`，实时保存原始弹幕 JSONL，并在录制结束后生成可被 FFmpeg 使用的 ASS 弹幕文件：
+
+```yaml
+danmaku:
+  enabled: true
+  burn_in: true
+  poll_seconds: 2
+  display_seconds: 14
+  lane_count: 12
+  font_size: 32
+  font_opacity: 0.6
+  max_user_name_chars: 16
+  include_user_name: true
+  include_system_messages: false
+```
+
+`burn_in: true` 时，弹幕会在转码阶段直接烧进 `processed` MP4；最终 `upload` 目录也会保留同名 `.danmaku.ass` 和 `.danmaku.jsonl` sidecar，方便之后检查或重新处理。
 
 ### 上传 Bilibili
 

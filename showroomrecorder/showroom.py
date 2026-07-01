@@ -145,14 +145,39 @@ class ShowroomClient:
         data = self._get_json("/api/live/streaming_url", {"room_id": room_id})
         urls: list[str] = []
         self._collect_urls(data, urls)
-        return urls
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        return deduped
 
-    def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    def get_comment_log(self, room: RoomConfig, timeout_seconds: int | None = None) -> list[dict[str, Any]]:
+        room_id = self.ensure_room_id(room)
+        data = self._get_json(
+            "/api/live/comment_log",
+            {"room_id": room_id},
+            timeout_seconds=timeout_seconds,
+        )
+        items = data.get("comment_log")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return []
+
+    def _get_json(
+        self,
+        path: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.BASE}{path}"
         last_error: requests.RequestException | None = None
+        timeout = timeout_seconds or self.timeout_seconds
         for attempt in range(2):
             try:
-                response = self.session.get(url, params=params, timeout=self.timeout_seconds)
+                response = self.session.get(url, params=params, timeout=timeout)
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data, dict):

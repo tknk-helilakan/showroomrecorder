@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime
 from pathlib import Path
 
 from .config import load_config
@@ -27,6 +28,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Check all rooms once and exit unless a live recording starts.",
     )
+    parser.add_argument(
+        "--process-raw",
+        type=Path,
+        help="Process, subtitle, and upload an existing raw recording file.",
+    )
+    parser.add_argument(
+        "--room",
+        help="Room name or room_id for --process-raw. Defaults to inferring from the raw path.",
+    )
+    parser.add_argument(
+        "--started-at",
+        help="ISO timestamp override for --process-raw, for example 2026-06-03T21:22:03.",
+    )
+    parser.add_argument(
+        "--ended-at",
+        help="ISO timestamp override for --process-raw. Defaults to the raw file modified time.",
+    )
+    parser.add_argument(
+        "--title",
+        help="Live title override for --process-raw. Defaults to the configured room name.",
+    )
     return parser.parse_args()
 
 
@@ -35,4 +57,19 @@ def main() -> None:
     config = load_config(Path(args.config))
     setup_logging(config.service.log_level, config.paths.logs_dir)
     service = ShowroomRecorderService(config)
+    if args.process_raw:
+        service.process_existing_recording(
+            args.process_raw,
+            room_ref=args.room,
+            started_at=_parse_datetime(args.started_at),
+            ended_at=_parse_datetime(args.ended_at),
+            title=args.title,
+        )
+        return
     asyncio.run(service.run(once=args.once))
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)

@@ -29,7 +29,8 @@ class LiveSession:
     mp4_file: Path | None = None
     ja_srt_file: Path | None = None
     zh_srt_file: Path | None = None
+    danmaku_ass_file: Path | None = None
+    danmaku_jsonl_file: Path | None = None
     upload_file: Path | None = None
     bvid: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
