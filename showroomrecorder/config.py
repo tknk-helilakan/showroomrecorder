@@ -103,8 +103,19 @@ class AsrConfig:
     device: str = "auto"
     compute_type: str = "auto"
     language: str = "ja"
+    task: str = "transcribe"
     beam_size: int = 5
     vad_filter: bool = True
+    vad_parameters: dict[str, Any] = field(default_factory=dict)
+    condition_on_previous_text: bool = True
+    temperature: float | list[float] | None = None
+    no_speech_threshold: float | None = None
+    log_prob_threshold: float | None = None
+    compression_ratio_threshold: float | None = None
+    word_timestamps: bool = False
+    hallucination_silence_threshold: float | None = None
+    initial_prompt: str = ""
+    log_progress: bool = False
     normalize_audio: bool = True
 
 
@@ -203,6 +214,25 @@ def load_config(path: Path) -> AppConfig:
     record.min_file_size_mb = max(0.0, float(record.min_file_size_mb or 0.0))
     record.min_duration_seconds = max(0.0, float(record.min_duration_seconds or 0.0))
 
+    asr = AsrConfig(**(raw.get("asr") or {}))
+    asr.task = str(asr.task or "transcribe").lower()
+    if asr.task not in {"transcribe", "translate"}:
+        raise ValueError("asr.task must be 'transcribe' or 'translate'")
+    asr.beam_size = max(1, int(asr.beam_size or 1))
+    if isinstance(asr.temperature, list):
+        asr.temperature = [float(value) for value in asr.temperature]
+    elif asr.temperature is not None:
+        asr.temperature = float(asr.temperature)
+    for field_name in (
+        "no_speech_threshold",
+        "log_prob_threshold",
+        "compression_ratio_threshold",
+        "hallucination_silence_threshold",
+    ):
+        value = getattr(asr, field_name)
+        if value is not None:
+            setattr(asr, field_name, float(value))
+
     danmaku = DanmakuConfig(**(raw.get("danmaku") or {}))
     danmaku.poll_seconds = max(0.5, float(danmaku.poll_seconds or 2.0))
     danmaku.request_timeout_seconds = max(1, int(danmaku.request_timeout_seconds or 10))
@@ -224,7 +254,7 @@ def load_config(path: Path) -> AppConfig:
         naming=NamingConfig(**(raw.get("naming") or {})),
         record=record,
         transcode=TranscodeConfig(**(raw.get("transcode") or {})),
-        asr=AsrConfig(**(raw.get("asr") or {})),
+        asr=asr,
         translation=TranslationConfig(**(raw.get("translation") or {})),
         subtitles=SubtitlesConfig(**(raw.get("subtitles") or {})),
         danmaku=danmaku,

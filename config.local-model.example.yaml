@@ -57,8 +57,25 @@ asr:
   compute_type: "int8" # CPU: int8. NVIDIA GPU: float16.
   normalize_audio: true
   language: "ja"
+  task: "transcribe"
   beam_size: 5
   vad_filter: true
+  vad_parameters: {}
+  # 直播和歌曲建议关闭，避免上一段识别错误继续影响下一段。
+  condition_on_previous_text: false
+  # 固定为 0，禁用逐步升温重试，输出更稳定。
+  temperature: 0.0
+  # 数值越高越不容易判定为静音；直播场景建议先保留默认值 0.6。
+  no_speech_threshold: 0.6
+  # 越接近 0 越严格，-1.0 比 -1.2 更能过滤低置信度内容。
+  log_prob_threshold: -1.0
+  compression_ratio_threshold: 2.4
+  # 启用字级时间戳后，静音幻觉阈值才会生效。
+  word_timestamps: true
+  hallucination_silence_threshold: 2.0
+  # 可填写人名、组合名等日语提示；留空表示不使用提示词。
+  initial_prompt: ""
+  log_progress: false
 
 translation:
   enabled: true

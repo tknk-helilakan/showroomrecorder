@@ -264,6 +264,7 @@ class FasterWhisperTranscriber:
         self.config = config
         self.ffmpeg_bin = ffmpeg_bin
         self._model = None
+        self._dll_directory_handles: list[Any] = []
 
     def transcribe(self, media_file: Path) -> list[SubtitleSegment]:
         if self.config.provider != "faster_whisper":
@@ -271,11 +272,32 @@ class FasterWhisperTranscriber:
         model = self._load_model()
         input_file = self._prepare_audio(media_file) if self.config.normalize_audio else media_file
         LOGGER.info("Starting ASR with faster-whisper model=%s file=%s", self.config.model, input_file)
+        transcribe_options: dict[str, Any] = {
+            "language": self.config.language,
+            "task": self.config.task,
+            "beam_size": self.config.beam_size,
+            "vad_filter": self.config.vad_filter,
+            "condition_on_previous_text": self.config.condition_on_previous_text,
+            "word_timestamps": self.config.word_timestamps,
+            "log_progress": self.config.log_progress,
+        }
+        optional_options = {
+            "temperature": self.config.temperature,
+            "no_speech_threshold": self.config.no_speech_threshold,
+            "log_prob_threshold": self.config.log_prob_threshold,
+            "compression_ratio_threshold": self.config.compression_ratio_threshold,
+            "hallucination_silence_threshold": self.config.hallucination_silence_threshold,
+        }
+        transcribe_options.update(
+            (name, value) for name, value in optional_options.items() if value is not None
+        )
+        if self.config.initial_prompt:
+            transcribe_options["initial_prompt"] = self.config.initial_prompt
+        if self.config.vad_parameters:
+            transcribe_options["vad_parameters"] = self.config.vad_parameters
         segments_iter, info = model.transcribe(
             str(input_file),
-            language=self.config.language,
-            beam_size=self.config.beam_size,
-            vad_filter=self.config.vad_filter,
+            **transcribe_options,
         )
         LOGGER.info(
             "ASR detected language=%s probability=%.3f duration=%.2fs",
@@ -333,6 +355,7 @@ class FasterWhisperTranscriber:
     def _load_model(self):
         if self._model is not None:
             return self._model
+        self._configure_windows_cuda_dlls()
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
@@ -349,3 +372,25 @@ class FasterWhisperTranscriber:
             **kwargs,
         )
         return self._model
+
+    def _configure_windows_cuda_dlls(self) -> None:
+        if os.name != "nt" or self.config.device == "cpu":
+            return
+        try:
+            import torch
+        except ImportError:
+            return
+
+        if self.config.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "ASR device is set to cuda, but CUDA is unavailable in the installed PyTorch build"
+            )
+
+        torch_lib = Path(torch.__file__).resolve().parent / "lib"
+        if not torch_lib.is_dir():
+            return
+        torch_lib_text = str(torch_lib)
+        if torch_lib_text not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = torch_lib_text + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            self._dll_directory_handles.append(os.add_dll_directory(torch_lib_text))
