@@ -25,7 +25,7 @@
 
 ## 环境要求
 
-- Python 3.8+（建议 3.10+）
+- Python 3.12
 - FFmpeg 可执行文件在 `PATH` 中。
 - `yt-dlp`，通过本项目依赖安装。
 - `biliup`，用于 Bilibili 投稿。可以按 `biliup` 官方文档安装并登录。

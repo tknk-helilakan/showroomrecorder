@@ -60,7 +60,9 @@ class RecordConfig:
     extra_args: list[str] = field(default_factory=list)
     cookies_file: Path | None = None
     min_file_size_mb: float = 5
+    min_duration_seconds: float = 10
     max_seconds: int | None = None
+    ffmpeg_fallback_to_ytdlp: bool = True
 
 
 @dataclass
@@ -198,6 +200,8 @@ def load_config(path: Path) -> AppConfig:
 
     record = RecordConfig(**(raw.get("record") or {}))
     record.cookies_file = _optional_path(base_dir, record.cookies_file)
+    record.min_file_size_mb = max(0.0, float(record.min_file_size_mb or 0.0))
+    record.min_duration_seconds = max(0.0, float(record.min_duration_seconds or 0.0))
 
     danmaku = DanmakuConfig(**(raw.get("danmaku") or {}))
     danmaku.poll_seconds = max(0.5, float(danmaku.poll_seconds or 2.0))

@@ -34,6 +34,8 @@ record:
   extra_args: []
   cookies_file: ""
   min_file_size_mb: 5
+  min_duration_seconds: 10
+  ffmpeg_fallback_to_ytdlp: true
 
 transcode:
   enabled: true

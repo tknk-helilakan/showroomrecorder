@@ -882,21 +882,15 @@ class ShowroomRecorderService:
 
         if self.config.upload.keep_latest_upload_per_room and session.upload_file:
             upload_dir = session.upload_file.parent
+            latest_mtime = session.upload_file.stat().st_mtime if session.upload_file.exists() else None
             for path in upload_dir.iterdir():
+                if latest_mtime is not None:
+                    try:
+                        if path.stat().st_mtime > latest_mtime:
+                            continue
+                    except OSError:
+                        continue
                 removed.extend(self._remove_cleanup_path(path, keep))
-            room_slug = slugify(session.room.name)
-            for parent_dir in (
-                self.config.paths.raw_dir,
-                self.config.paths.processed_dir,
-                self.config.paths.subtitles_dir,
-                self.config.paths.danmaku_dir,
-                self.config.paths.work_dir,
-            ):
-                room_dir = parent_dir / room_slug
-                if not room_dir.exists():
-                    continue
-                for path in room_dir.iterdir():
-                    removed.extend(self._remove_cleanup_path(path, keep))
 
         LOGGER.info("Cleanup after successful upload removed %d path(s)", len(removed))
         return removed

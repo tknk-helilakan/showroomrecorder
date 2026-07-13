@@ -28,6 +28,8 @@ naming:
 record:
   strategy: "ffmpeg"
   min_file_size_mb: 0.1
+  min_duration_seconds: 10
+  ffmpeg_fallback_to_ytdlp: true
   # Optional test-only limit. Leave empty/null for normal full-live recording.
   max_seconds:
 

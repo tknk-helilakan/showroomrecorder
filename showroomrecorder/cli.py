@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
 from .config import load_config
 from .logging_setup import setup_logging
@@ -12,7 +13,7 @@ from .runner import ShowroomRecorderService
 DEFAULT_CONFIG = r"E:\helilokan\Test\showroomrecord\config.yaml"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="showroomrecorder",
         description="Watch SHOWROOM rooms, record lives, transcode, subtitle, translate, and upload.",
@@ -49,11 +50,20 @@ def parse_args() -> argparse.Namespace:
         "--title",
         help="Live title override for --process-raw. Defaults to the configured room name.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--yt-dlp-worker",
+        nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
+    if args.yt_dlp_worker is not None:
+        _run_yt_dlp_worker(args.yt_dlp_worker)
+        return
+
     config = load_config(Path(args.config))
     setup_logging(config.service.log_level, config.paths.logs_dir)
     service = ShowroomRecorderService(config)
@@ -67,6 +77,12 @@ def main() -> None:
         )
         return
     asyncio.run(service.run(once=args.once))
+
+
+def _run_yt_dlp_worker(arguments: Sequence[str]) -> None:
+    from yt_dlp import main as yt_dlp_main
+
+    yt_dlp_main(list(arguments))
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
