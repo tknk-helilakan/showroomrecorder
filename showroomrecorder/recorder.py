@@ -6,6 +6,7 @@ import math
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import AppConfig, RoomConfig
@@ -23,6 +24,8 @@ class StreamRecorder:
 
     def record(self, session: LiveSession) -> Path:
         strategy = self.config.record.strategy.lower()
+        if strategy == "streamlink":
+            return self._record_with_streamlink(session)
         if strategy == "yt_dlp":
             urls = self.showroom.get_streaming_urls(session.room)
             if not urls:
@@ -43,6 +46,8 @@ class StreamRecorder:
             "--newline",
             "--no-playlist",
             "--hls-use-mpegts",
+            "--fragment-retries",
+            str(self.config.record.hls_fragment_retries),
             "-o",
             str(output_template),
         ]
@@ -62,8 +67,75 @@ class StreamRecorder:
             )
         command.extend(self.config.record.extra_args)
         command.append(source_url or room.url)
-        self._run_record_command(command, capture_dir / "yt-dlp.log")
-        return self._find_recorded_file(capture_dir)
+        elapsed = self._run_record_command(command, capture_dir / "yt-dlp.log")
+        recorded_file = self._find_recorded_file(capture_dir)
+        self._write_capture_health_report(recorded_file, elapsed, recorder="yt-dlp")
+        return recorded_file
+
+    def _record_with_streamlink(self, session: LiveSession) -> Path:
+        urls = self.showroom.get_streaming_urls(session.room)
+        if not urls:
+            raise RuntimeError(f"No streaming URL returned for room {session.room.name}")
+        stream_urls = self._ordered_stream_urls(urls)
+        capture_dir = self._capture_dir(session)
+        errors: list[str] = []
+        for index, stream_url in enumerate(stream_urls, start=1):
+            output_file = capture_dir / f"recording-{index:02d}.ts"
+            if output_file.exists():
+                output_file.unlink()
+            log_file = capture_dir / f"streamlink-record-{index:02d}.log"
+            command = self._streamlink_record_command(stream_url, output_file)
+            LOGGER.info(
+                "Trying SHOWROOM stream URL %d/%d with Streamlink for %s",
+                index,
+                len(stream_urls),
+                session.room.name,
+            )
+            try:
+                elapsed = self._run_record_command(command, log_file)
+                self._write_capture_health_report(output_file, elapsed, recorder="streamlink")
+                recorded_file = self._validate_recorded_file(output_file)
+                return recorded_file
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{stream_url}: {exc}")
+                LOGGER.warning(
+                    "Streamlink recording attempt %d/%d failed for %s: %s",
+                    index,
+                    len(stream_urls),
+                    session.room.name,
+                    exc,
+                )
+
+        if self.config.record.streamlink_fallback_to_ffmpeg:
+            LOGGER.warning(
+                "All Streamlink stream URL attempts failed for %s; falling back to FFmpeg",
+                session.room.name,
+            )
+            return self._record_with_ffmpeg(session)
+
+        details = "; ".join(errors[-3:])
+        raise RuntimeError(f"All Streamlink recording attempts failed for {session.room.name}: {details}")
+
+    def _streamlink_record_command(self, stream_url: str, output_file: Path) -> list[str]:
+        command = [
+            *self._streamlink_command_prefix(self.config.record.streamlink_bin),
+            "--loglevel",
+            "info",
+            "--force",
+            "--output",
+            str(output_file),
+            "--stream-segment-threads",
+            str(self.config.record.hls_concurrent_fragments),
+            "--stream-segment-attempts",
+            str(max(1, self.config.record.hls_fragment_retries)),
+        ]
+        for header in self._streamlink_input_headers():
+            command.extend(["--http-header", header])
+        if self.config.record.max_seconds:
+            command.extend(["--stream-segmented-duration", str(self.config.record.max_seconds)])
+        command.extend(self.config.record.streamlink_extra_args)
+        command.extend([stream_url, "best"])
+        return command
 
     def _record_with_ffmpeg(self, session: LiveSession) -> Path:
         urls = self.showroom.get_streaming_urls(session.room)
@@ -85,8 +157,10 @@ class StreamRecorder:
                 session.room.name,
             )
             try:
-                self._run_record_command(command, log_file)
-                return self._validate_recorded_file(output_file)
+                elapsed = self._run_record_command(command, log_file)
+                self._write_capture_health_report(output_file, elapsed, recorder="ffmpeg")
+                recorded_file = self._validate_recorded_file(output_file)
+                return recorded_file
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{stream_url}: {exc}")
                 LOGGER.warning(
@@ -119,6 +193,12 @@ class StreamRecorder:
             ),
             "-headers",
             self._ffmpeg_input_headers(),
+            "-http_persistent",
+            "1",
+            "-http_multiple",
+            "1",
+            "-seg_max_retry",
+            str(self.config.record.hls_fragment_retries),
             "-i",
             stream_url,
         ]
@@ -147,6 +227,21 @@ class StreamRecorder:
             headers.append(f"Cookie: {cookie_header}")
         return headers
 
+    def _streamlink_input_headers(self) -> list[str]:
+        headers = [
+            (
+                "User-Agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Referer=https://www.showroom-live.com/",
+            "Origin=https://www.showroom-live.com",
+            "Accept=*/*",
+        ]
+        cookie_header = self._showroom_cookie_header()
+        if cookie_header:
+            headers.append(f"Cookie={cookie_header}")
+        return headers
+
     def _showroom_cookie_header(self) -> str:
         cookies = getattr(self.showroom.session, "cookies", None)
         if not cookies:
@@ -162,8 +257,9 @@ class StreamRecorder:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
-    def _run_record_command(self, command: list[str], log_file: Path) -> None:
+    def _run_record_command(self, command: list[str], log_file: Path) -> float:
         LOGGER.info("Starting recording command: %s", self._format_command_for_log(command))
+        started_at = time.monotonic()
         with log_file.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 command,
@@ -179,8 +275,10 @@ class StreamRecorder:
                 log.flush()
                 LOGGER.info("[record] %s", line.rstrip())
             code = process.wait()
+        elapsed = max(0.0, time.monotonic() - started_at)
         if code != 0:
             raise RuntimeError(f"Recording command failed with exit code {code}. See log: {log_file}")
+        return elapsed
 
     def _find_recorded_file(self, capture_dir: Path) -> Path:
         candidates = [
@@ -251,6 +349,44 @@ class StreamRecorder:
             return None
         return duration
 
+    def _write_capture_health_report(
+        self,
+        media_file: Path,
+        wall_duration: float,
+        *,
+        recorder: str,
+    ) -> None:
+        media_duration = self._probe_duration(media_file)
+        ratio = media_duration / wall_duration if media_duration is not None and wall_duration > 0 else None
+        threshold = self.config.record.capture_realtime_ratio_warning
+        degraded = ratio is not None and threshold > 0 and ratio < threshold
+        report = {
+            "recorder": recorder,
+            "media_file": str(media_file),
+            "wall_duration_seconds": round(wall_duration, 3),
+            "media_duration_seconds": round(media_duration, 3) if media_duration is not None else None,
+            "realtime_ratio": round(ratio, 6) if ratio is not None else None,
+            "warning_threshold": threshold,
+            "degraded": degraded,
+        }
+        report_file = media_file.with_suffix(media_file.suffix + ".capture.json")
+        report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        if degraded:
+            LOGGER.warning(
+                "Capture health degraded for %s: media %.2fs / wall %.2fs = %.3f (< %.3f)",
+                media_file,
+                media_duration,
+                wall_duration,
+                ratio,
+                threshold,
+            )
+        else:
+            LOGGER.info(
+                "Capture health report saved: %s realtime_ratio=%s",
+                report_file,
+                f"{ratio:.3f}" if ratio is not None else "unknown",
+            )
+
     def _ffprobe_bin(self) -> str:
         ffmpeg_path = Path(self.config.transcode.ffmpeg_bin)
         if ffmpeg_path.name.lower().startswith("ffmpeg"):
@@ -285,6 +421,12 @@ class StreamRecorder:
                 and item.lower().startswith("cookie:")
             ):
                 redacted.append("Cookie: <redacted>")
+            elif (
+                index > 0
+                and command[index - 1] == "--http-header"
+                and item.lower().startswith("cookie=")
+            ):
+                redacted.append("Cookie=<redacted>")
             else:
                 redacted.append(item)
         return " ".join(redacted)
@@ -309,3 +451,16 @@ class StreamRecorder:
         if getattr(sys, "frozen", False):
             return [sys.executable, "--yt-dlp-worker"]
         return [sys.executable, "-m", "yt_dlp"]
+
+    def _streamlink_command_prefix(self, bin_name: str) -> list[str]:
+        if shutil.which(bin_name) is not None:
+            return [bin_name]
+        try:
+            import streamlink  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Streamlink executable not found in PATH and streamlink module is not installed: {bin_name}"
+            ) from exc
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--streamlink-worker"]
+        return [sys.executable, "-m", "streamlink"]

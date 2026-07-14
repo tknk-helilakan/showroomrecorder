@@ -18,6 +18,8 @@ hiddenimports = []
 hiddenimports += collect_submodules("showroomrecorder")
 hiddenimports += try_collect(collect_submodules, "faster_whisper")
 hiddenimports += try_collect(collect_submodules, "ctranslate2")
+hiddenimports += try_collect(collect_submodules, "streamlink")
+hiddenimports += try_collect(collect_submodules, "streamlink_cli")
 hiddenimports += try_collect(collect_submodules, "transformers.models.nllb")
 hiddenimports += try_collect(collect_submodules, "transformers.models.m2m_100")
 hiddenimports += try_collect(collect_submodules, "transformers.generation")
@@ -43,6 +45,8 @@ for package in (
     "transformers",
     "huggingface_hub",
     "torch",
+    "streamlink",
+    "streamlink_cli",
 ):
     datas += try_collect(collect_data_files, package, include_py_files=False)
     binaries += try_collect(collect_dynamic_libs, package)
@@ -51,6 +55,7 @@ for distribution in (
     "PyYAML",
     "requests",
     "yt-dlp",
+    "streamlink",
     "faster-whisper",
     "ctranslate2",
     "av",

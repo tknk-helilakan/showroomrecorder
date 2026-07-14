@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -55,6 +56,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs=argparse.REMAINDER,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--streamlink-worker",
+        nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args(argv)
 
 
@@ -62,6 +68,9 @@ def main() -> None:
     args = parse_args()
     if args.yt_dlp_worker is not None:
         _run_yt_dlp_worker(args.yt_dlp_worker)
+        return
+    if args.streamlink_worker is not None:
+        _run_streamlink_worker(args.streamlink_worker)
         return
 
     config = load_config(Path(args.config))
@@ -83,6 +92,17 @@ def _run_yt_dlp_worker(arguments: Sequence[str]) -> None:
     from yt_dlp import main as yt_dlp_main
 
     yt_dlp_main(list(arguments))
+
+
+def _run_streamlink_worker(arguments: Sequence[str]) -> None:
+    from streamlink_cli.main import main as streamlink_main
+
+    original_argv = sys.argv
+    sys.argv = ["streamlink", *arguments]
+    try:
+        streamlink_main()
+    finally:
+        sys.argv = original_argv
 
 
 def _parse_datetime(value: str | None) -> datetime | None:

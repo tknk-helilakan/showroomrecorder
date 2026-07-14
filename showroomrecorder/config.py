@@ -55,14 +55,20 @@ class NamingConfig:
 
 @dataclass
 class RecordConfig:
-    strategy: str = "yt_dlp"
+    strategy: str = "streamlink"
     yt_dlp_bin: str = "yt-dlp"
+    streamlink_bin: str = "streamlink"
     extra_args: list[str] = field(default_factory=list)
+    streamlink_extra_args: list[str] = field(default_factory=list)
     cookies_file: Path | None = None
     min_file_size_mb: float = 5
     min_duration_seconds: float = 10
     max_seconds: int | None = None
     ffmpeg_fallback_to_ytdlp: bool = True
+    streamlink_fallback_to_ffmpeg: bool = True
+    hls_concurrent_fragments: int = 8
+    hls_fragment_retries: int = 5
+    capture_realtime_ratio_warning: float = 0.95
 
 
 @dataclass
@@ -71,7 +77,7 @@ class TranscodeConfig:
     ffmpeg_bin: str = "ffmpeg"
     width: int | None = 1920
     height: int | None = 1080
-    fps: int | None = 30
+    fps: int | None = None
     scale_mode: str = "fit"
     video_codec: str = "libx264"
     preset: str = "medium"
@@ -213,6 +219,15 @@ def load_config(path: Path) -> AppConfig:
     record.cookies_file = _optional_path(base_dir, record.cookies_file)
     record.min_file_size_mb = max(0.0, float(record.min_file_size_mb or 0.0))
     record.min_duration_seconds = max(0.0, float(record.min_duration_seconds or 0.0))
+    record.hls_concurrent_fragments = min(
+        10,
+        max(1, int(record.hls_concurrent_fragments or 1)),
+    )
+    record.hls_fragment_retries = max(0, int(record.hls_fragment_retries or 0))
+    record.capture_realtime_ratio_warning = min(
+        1.0,
+        max(0.0, float(record.capture_realtime_ratio_warning or 0.0)),
+    )
 
     asr = AsrConfig(**(raw.get("asr") or {}))
     asr.task = str(asr.task or "transcribe").lower()

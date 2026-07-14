@@ -27,13 +27,19 @@ naming:
   dynamic_template: "{streamer} SHOWROOM直播录像"
 
 record:
-  strategy: "yt_dlp"
+  strategy: "streamlink"
   yt_dlp_bin: "yt-dlp"
+  streamlink_bin: "streamlink"
   extra_args: []
+  streamlink_extra_args: []
   cookies_file: ""
   min_file_size_mb: 5
   min_duration_seconds: 10
   ffmpeg_fallback_to_ytdlp: true
+  streamlink_fallback_to_ffmpeg: true
+  hls_concurrent_fragments: 8
+  hls_fragment_retries: 5
+  capture_realtime_ratio_warning: 0.95
   # Optional test-only limit. Leave empty/null for normal full-live recording.
   max_seconds:
 
@@ -42,7 +48,8 @@ transcode:
   ffmpeg_bin: "ffmpeg"
   width: 1920
   height: 1080
-  fps: 30
+  # Empty preserves the source frame cadence.
+  fps:
   scale_mode: "fit"
   video_codec: "libx264"
   preset: "medium"
