@@ -64,7 +64,6 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
                 live_end_confirmations=confirmations,
                 live_end_check_interval_seconds=0,
             ),
-            danmaku=SimpleNamespace(enabled=False),
             paths=SimpleNamespace(
                 raw_dir=root / "raw",
                 work_dir=root / "work",

@@ -1,13 +1,12 @@
-# Showroom Recorder Pipeline
+# Showroom Recorder Lite
 
-一个本地常驻服务，用来监听配置的 SHOWROOM 直播间，开播后自动录制、转码、生成日语识别字幕、翻译中文字幕，并按配置调用 `biliup` 上传到 Bilibili。
+一个简化的本地常驻服务，用来监听配置的 SHOWROOM 直播间，开播后自动录制、转码、生成日语识别字幕并翻译中文字幕。本分支不包含弹幕捕获和平台上传功能。
 
 ## 功能
 
 - 轮询 SHOWROOM 直播间开播状态。
-- 开播后调用 `yt-dlp` 录制直播流到本地。
+- 开播后调用 Streamlink、FFmpeg 或 `yt-dlp` 录制直播流到本地。
 - 调用 `ffmpeg` 保留源时间戳并转码为指定分辨率的 MP4。
-- 可选捕获 SHOWROOM 弹幕，保存 `.danmaku.ass` / `.danmaku.jsonl`，并在转码时同步烧进画面。
 - 调用 OpenAI Audio transcription API 做日语语音识别，生成 `.ja.srt`。
 - 支持多种翻译后端生成 `.zh.srt`：
   - `openai_responses`：OpenAI Responses API，默认准确率优先。
@@ -16,35 +15,30 @@
   - `argos`：本地 Argos Translate。
   - `external`：你自己的翻译命令。
   - `none`：不翻译，只保留日语字幕。
-- 支持把中文字幕硬压进 MP4 后上传，或只上传无硬字幕 MP4 并保留字幕文件。
-- 上传通过 `biliup` 命令行完成，并可选尝试调用 Bilibili 字幕草稿接口上传字幕。
-- 支持按月合集投稿：本月第一次自动新投稿，后续直播自动追加分 P。
-- 可配置上传成功后只保留最终上传用 MP4 和字幕文件，清理中间产物。
+- 支持保留独立 SRT，也可选择额外生成烧录中文字幕的 MP4。
+- 断流后在同一个任务内重连，并对合并和转码成品执行音画同步校验。
 
-请只录制和上传你有权处理的直播内容，并遵守 SHOWROOM 与 Bilibili 的平台规则。
+请只录制你有权处理的直播内容，并遵守 SHOWROOM 的平台规则。
 
 ## 环境要求
 
 - Python 3.12
 - FFmpeg 可执行文件在 `PATH` 中。
 - `yt-dlp`，通过本项目依赖安装。
-- `biliup`，用于 Bilibili 投稿。可以按 `biliup` 官方文档安装并登录。
 
 ## 版本包和打包策略
 
-Release 会提供一份默认的 Windows x64 CPU 版 zip：`showroomrecorder-windows-x64-cpu.zip`。
+Release 会提供一份默认的 Windows x64 CPU 版 zip：`showroomrecorder-lite-windows-x64-cpu.zip`。
 
 这份包只包含程序运行时和示例配置，不包含：
 
 - 本地 ASR 模型
 - 本地翻译模型
 - `config.yaml`
-- Bilibili cookie
-- `biliup.exe`
 - FFmpeg
 - 录制和输出数据
 
-默认 Release 包面向“本地模型 + CPU 计算”的使用方式。使用者需要自己把模型下载到 `models/asr/` 和 `models/translation/`，并复制 `config.local-model.example.yaml` 为 `config.yaml` 后修改房间、模型路径、上传配置。
+默认 Release 包面向“本地模型 + CPU 计算”的使用方式。使用者需要自己把模型下载到 `models/asr/` 和 `models/translation/`，并复制 `config.local-model.example.yaml` 为 `config.yaml` 后修改房间和模型路径。
 
 如果要用 NVIDIA GPU/CUDA、本机特定版本的 PyTorch，或只使用 OpenAI 在线服务，建议在自己的环境里从源码运行或重新执行 `build.ps1` 打包。这样 exe 会按本机安装的依赖和 CUDA/CPU 运行时生成。
 
@@ -55,13 +49,6 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
 pip install -r requirements.txt
-```
-
-安装并登录 `biliup` 后，建议把 cookie 文件放在 `data\biliup-cookies.json`：
-
-```powershell
-New-Item -ItemType Directory -Force data
-biliup -u data\biliup-cookies.json login
 ```
 
 ## 配置
@@ -78,7 +65,7 @@ Copy-Item config.example.yaml config.yaml
 - `transcode`：设置输出分辨率、帧率、码率/CRF。
 - `asr`：设置转写接口、模型、音频切片。
 - `translation`：设置翻译后端。
-- `upload`：设置 B 站标题、分区、标签、cookie 文件等。
+- `subtitles`：设置换行、双语和可选硬字幕输出。
 
 ## 运行
 
@@ -92,28 +79,24 @@ python -m showroomrecorder --config config.yaml
 - `raw`：同一直播任务的原始分段、FFconcat 清单和合并后的录制文件。
 - `processed`：转码后的 MP4。
 - `subtitles`：日语和中文字幕。
-- `danmaku`：弹幕 JSONL 和 ASS 文件。
-- `upload`：最终上传用视频。
 - `jobs.jsonl`：任务流水日志。
 
 ## 运行流程
 
 服务启动后会为 `rooms` 中每个启用的直播间建立一个监听任务。多个直播间可以同时监听；如果多个房间同时开播，也可以同时录制。
 
-一次直播只对应一个逻辑任务。Streamlink/FFmpeg 因 403、超时或暂时没有新分片而退出时，服务会重新查询房间状态和最新播放地址；只要房间仍在线，就在同一个 `job_id` 下继续写入下一个分段。连续达到 `record.live_end_confirmations` 次下线确认后，才结束弹幕捕获并结算任务。
+一次直播只对应一个逻辑任务。Streamlink/FFmpeg 因 403、超时或暂时没有新分片而退出时，服务会重新查询房间状态和最新播放地址；只要房间仍在线，就在同一个 `job_id` 下继续写入下一个分段。连续达到 `record.live_end_confirmations` 次下线确认后，才结算任务。
 
 直播确认结束后，任务会进入处理队列，按顺序执行：
 
 - 按录制顺序合并原始分段并重建连续时间戳
 - 转码 MP4
-- 用 `ffprobe` 校验音视频流结束时间，异常成品保留在本地但不上传
-- 如果启用弹幕烧录，转码时把 `.danmaku.ass` 同步显示在画面中
+- 用 `ffprobe` 校验音视频流结束时间，异常成品保留在本地并停止后续处理
 - 日语语音识别
 - 翻译中文字幕并生成字幕文件
-- 准备上传视频
-- 按配置上传 Bilibili
+- 根据 `subtitles.burn_in` 选择是否额外生成硬字幕 MP4
 
-默认 `service.processing_parallelism: 1`，所以识别、翻译、压字幕、上传会一个一个完成。你可以监听和录制多个直播间，但后处理队列保持串行，避免同时跑多个大模型或上传任务。
+默认 `service.processing_parallelism: 1`，所以识别、翻译和压字幕会一个一个完成。你可以监听和录制多个直播间，但后处理队列保持串行，避免同时跑多个大模型任务。
 
 ## 常见配置说明
 
@@ -127,9 +110,7 @@ record:
   hls_concurrent_fragments: 2
 ```
 
-默认在录制进程退出后等待 5 秒重连。房间首次显示下线后，每 20 秒复查一次，连续 4 次确认下线（总计约 60 秒）才结束同一逻辑任务，因此短暂断流或主播快速重连不会产生多个独立上传。各段保存在 `raw/<主播>/<job_id>/segments/`，随后逐段重建从零开始的音视频 PTS，再通过 FFmpeg concat filter 合并为连续时间轴。`hls_concurrent_fragments` 默认使用 2，避免对 SHOWROOM CDN 发起过多并行分片请求。
-
-弹幕 JSONL 保留原始墙钟时间；生成 ASS 时会按每段录制的实际媒体时长映射到合并后的视频时间轴。断流期间没有对应画面的评论不会烧录到后续片段上。
+默认在录制进程退出后等待 5 秒重连。房间首次显示下线后，每 20 秒复查一次，连续 4 次确认下线（总计约 60 秒）才结束同一逻辑任务，因此短暂断流或主播快速重连不会产生多个独立任务。各段保存在 `raw/<主播>/<job_id>/segments/`，随后逐段重建从零开始的音视频 PTS，再通过 FFmpeg concat filter 合并为连续时间轴。`hls_concurrent_fragments` 默认使用 2，避免对 SHOWROOM CDN 发起过多并行分片请求。
 
 ### 转码时间戳和音画校验
 
@@ -141,11 +122,11 @@ transcode:
   max_av_desync_seconds: 3
 ```
 
-SHOWROOM 的 MPEG-TS 元数据可能把实际约 30fps 的画面标成 20fps。`fps` 留空时程序按源 PTS 做 VFR 编码，不会使用名义帧率重算每一帧的时间。合并、转码、硬字幕输出以及上传恢复前都会比较视频流和音频流的结束时间；差值超过阈值时任务失败并停止上传，原始分段、合并文件、成品和 FFmpeg 日志都会保留用于检查。
+SHOWROOM 的 MPEG-TS 元数据可能把实际约 30fps 的画面标成 20fps。`fps` 留空时程序按源 PTS 做 VFR 编码，不会使用名义帧率重算每一帧的时间。合并、转码和硬字幕输出后都会比较视频流和音频流的结束时间；差值超过阈值时任务失败，原始分段、合并文件、成品和 FFmpeg 日志都会保留用于检查。
 
 ### 录制代理回退
 
-`record.proxy` 只作用于直播流下载，会同时传给 Streamlink、FFmpeg 和 yt-dlp，不会改变 Bilibili 上传线路。`mode: auto` 的顺序是：Windows 显式系统代理、当前系统/TUN 路由、项目代理。这样系统代理或 TUN 正常时保持原线路，直连录制失败后才使用项目代理。
+`record.proxy` 只作用于直播流下载，会同时传给 Streamlink、FFmpeg 和 yt-dlp。`mode: auto` 的顺序是：Windows 显式系统代理、当前系统/TUN 路由、项目代理。这样系统代理或 TUN 正常时保持原线路，直连录制失败后才使用项目代理。
 
 ```yaml
 record:
@@ -297,78 +278,18 @@ translation:
     torch_dtype: "float16"
 ```
 
-### 弹幕捕获和烧录
+### 硬字幕输出
 
-启用后，录制直播的同时会轮询 SHOWROOM 的 `comment_log`，实时保存原始弹幕 JSONL，并在录制结束后生成可被 FFmpeg 使用的 ASS 弹幕文件：
+默认保留独立的 `.ja.srt` 和 `.zh.srt`。需要额外生成烧录中文字幕的视频时启用：
 
 ```yaml
-danmaku:
-  enabled: true
+subtitles:
+  max_line_chars: 24
+  bilingual: false
   burn_in: true
-  poll_seconds: 2
-  display_seconds: 14
-  lane_count: 12
-  font_size: 32
-  font_opacity: 0.6
-  max_user_name_chars: 16
-  include_user_name: true
-  include_system_messages: false
 ```
 
-`burn_in: true` 时，弹幕会在转码阶段直接烧进 `processed` MP4；最终 `upload` 目录也会保留同名 `.danmaku.ass` 和 `.danmaku.jsonl` sidecar，方便之后检查或重新处理。
-
-### 上传 Bilibili
-
-上传使用 `biliup`，配置示例：
-
-```yaml
-upload:
-  enabled: true
-  uploader: biliup
-  subtitle_mode: sidecar
-  cleanup_after_success: true
-  keep_latest_upload_per_room: true
-  biliup:
-    mode: monthly
-    bin: biliup
-    user_cookie: "data/biliup-cookies.json"
-    subtitle_language: zh
-    upload_subtitle_draft: true
-    subtitle_page_wait_seconds: 900
-    subtitle_page_poll_seconds: 30
-```
-
-默认 `subtitle_mode: hard_subbed`，会先生成一个硬字幕 MP4 再投稿，避免 B 站字幕上传接口变化导致字幕不可见。生成的 `.zh.srt` 仍会保留在本地。
-
-`biliup.mode` 可选：
-
-- `upload`：每次都新建投稿。
-- `append`：追加到 `append_vid` 或 `append_vids` 指定的已有投稿。
-- `monthly`：按 `monthly_key_template` 区分主播和月份；第一次新建投稿并把 BVID 写入 `data/biliup-monthly.json`，之后自动追加分 P。
-
-按月合集可以这样命名：
-
-```yaml
-naming:
-  title_template: "【高嶺のなでしこ-{streamer}】{started_at:%Y%m} showroom 直播合集"
-  part_title_template: "{started_at:%Y%m%d} showroom 直播"
-```
-
-如果想尝试上传 B 站字幕草稿：
-
-```yaml
-upload:
-  biliup:
-    upload_subtitle_draft: true
-    subtitle_language: zh
-    subtitle_page_wait_seconds: 900
-    subtitle_page_poll_seconds: 30
-    subtitle_save_attempts: 3
-    subtitle_save_retry_seconds: 5
-    subtitle_errors_fatal: true
-```
-
-这一步依赖 Bilibili 未公开接口，可能因为账号、审核、接口变化而失败。默认 `subtitle_errors_fatal: true`，字幕上传失败会让本次任务标记为失败并保留中间文件，方便重新生成或重传；如果只想视频投稿成功即可，可以改成 `false`。
+硬字幕成品写入 `processed` 目录，文件名带 `.subtitled`；原转码 MP4 和独立字幕文件仍会保留。
 
 ## 本地打包
 
@@ -405,6 +326,6 @@ git push origin main
 git push origin v0.1.0
 ```
 
-推送 tag 后，到 GitHub 的 Actions 页面等 `Build Windows CPU Release` 完成。成功后，Release 页面会出现 `showroomrecorder-windows-x64-cpu.zip`。
+推送 tag 后，到 GitHub 的 Actions 页面等 `Build Windows CPU Release (Lite)` 完成。成功后，Release 页面会出现 `showroomrecorder-lite-windows-x64-cpu.zip`。
 
 如果只是想生成 Actions Artifact 而不发 tag，可以在 GitHub Actions 页面手动运行 `workflow_dispatch`。

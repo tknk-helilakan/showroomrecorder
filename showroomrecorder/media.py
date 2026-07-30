@@ -123,9 +123,9 @@ class MediaProcessor:
         self.validate_av_sync(output_file)
         return output_file
 
-    def transcode(self, input_file: Path, output_file: Path, danmaku_file: Path | None = None) -> Path:
+    def transcode(self, input_file: Path, output_file: Path) -> Path:
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        vf = self._video_filter(danmaku_file=danmaku_file)
+        vf = self._video_filter()
         command = [
             self.config.ffmpeg_bin,
             "-hide_banner",
@@ -239,7 +239,7 @@ class MediaProcessor:
                 f"{media_file}: video ends at {timing.video_end:.3f}s, "
                 f"audio ends at {timing.audio_end:.3f}s "
                 f"(delta {timing.av_end_delta:.3f}s > {max_delta:.3f}s). "
-                "The file was retained and upload was blocked."
+                "The file was retained and processing was stopped."
             )
         return timing
 
@@ -310,7 +310,7 @@ class MediaProcessor:
             missing = "video" if video is None else "audio"
             raise RuntimeError(
                 f"A/V sync validation failed for {media_file}: missing {missing} stream. "
-                "The file was retained and upload was blocked."
+                "The file was retained and processing was stopped."
             )
 
         video_duration = _stream_duration(video)
@@ -318,7 +318,7 @@ class MediaProcessor:
         if video_duration is None or audio_duration is None:
             raise RuntimeError(
                 f"A/V sync validation failed for {media_file}: ffprobe did not report "
-                "usable video and audio durations. The file was retained and upload was blocked."
+                "usable video and audio durations. The file was retained and processing was stopped."
             )
         return MediaTiming(
             video_start=_finite_float(video.get("start_time")) or 0.0,
@@ -328,7 +328,7 @@ class MediaProcessor:
             format_duration=_finite_float((payload.get("format") or {}).get("duration")),
         )
 
-    def _video_filter(self, danmaku_file: Path | None = None) -> str:
+    def _video_filter(self) -> str:
         filters: list[str] = ["settb=AVTB", "setpts=PTS-STARTPTS"]
         width = self.config.width
         height = self.config.height
@@ -349,8 +349,6 @@ class MediaProcessor:
                 raise ValueError(f"Unsupported transcode.scale_mode: {self.config.scale_mode}")
         if self.config.fps:
             filters.append(f"fps={self.config.fps}")
-        if danmaku_file and danmaku_file.exists():
-            filters.append(f"subtitles={_escape_subtitle_path(danmaku_file)}")
         filters.append("format=yuv420p")
         return ",".join(filters)
 

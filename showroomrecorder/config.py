@@ -14,9 +14,6 @@ class ServiceConfig:
     status_parallelism: int = 2
     processing_parallelism: int = 1
     record_retry_cooldown_seconds: int = 180
-    upload_recovery_enabled: bool = True
-    upload_recovery_time: str = "03:00"
-    upload_recovery_stale_minutes: int = 120
     data_dir: Path = Path("data")
     log_level: str = "INFO"
 
@@ -27,8 +24,6 @@ class PathsConfig:
     raw_dir: Path
     processed_dir: Path
     subtitles_dir: Path
-    danmaku_dir: Path
-    upload_dir: Path
     work_dir: Path
     logs_dir: Path
     jobs_log: Path
@@ -47,10 +42,6 @@ class RoomConfig:
 @dataclass
 class NamingConfig:
     filename_template: str = "{streamer}_{started_at:%Y%m%d_%H%M%S}_{title_slug}"
-    part_title_template: str = "{started_at:%Y%m%d} showroom 直播"
-    title_template: str = "【{streamer}】SHOWROOM直播录像 {started_at:%Y-%m-%d %H:%M}"
-    desc_template: str = "自动录制的 SHOWROOM 直播录像。"
-    dynamic_template: str = "{streamer} SHOWROOM直播录像"
 
 
 @dataclass
@@ -165,36 +156,7 @@ class TranslationConfig:
 class SubtitlesConfig:
     max_line_chars: int = 24
     bilingual: bool = False
-
-
-@dataclass
-class DanmakuConfig:
-    enabled: bool = False
-    burn_in: bool = True
-    poll_seconds: float = 2.0
-    request_timeout_seconds: int = 10
-    display_seconds: float = 8.0
-    max_entries: int = 20000
-    max_text_chars: int = 80
-    max_user_name_chars: int = 16
-    lane_count: int = 12
-    font_name: str = "Microsoft YaHei"
-    font_size: int = 28
-    font_opacity: float = 0.6
-    top_margin: int = 24
-    bottom_margin: int = 140
-    include_user_name: bool = True
-    include_system_messages: bool = False
-
-
-@dataclass
-class UploadConfig:
-    enabled: bool = False
-    uploader: str = "biliup"
-    subtitle_mode: str = "hard_subbed"
-    cleanup_after_success: bool = False
-    keep_latest_upload_per_room: bool = False
-    biliup: dict[str, Any] = field(default_factory=dict)
+    burn_in: bool = False
 
 
 @dataclass
@@ -209,8 +171,6 @@ class AppConfig:
     asr: AsrConfig
     translation: TranslationConfig
     subtitles: SubtitlesConfig
-    danmaku: DanmakuConfig
-    upload: UploadConfig
 
 
 def load_config(path: Path) -> AppConfig:
@@ -222,13 +182,19 @@ def load_config(path: Path) -> AppConfig:
         raw = yaml.safe_load(fh) or {}
 
     base_dir = path.parent
-    service = ServiceConfig(**(raw.get("service") or {}))
+    service_raw = dict(raw.get("service") or {})
+    for legacy_key in (
+        "upload_recovery_enabled",
+        "upload_recovery_time",
+        "upload_recovery_stale_minutes",
+    ):
+        service_raw.pop(legacy_key, None)
+    service = ServiceConfig(**service_raw)
     service.data_dir = _resolve_path(base_dir, service.data_dir)
     service.poll_interval_seconds = max(1, int(service.poll_interval_seconds))
     service.status_parallelism = max(1, int(service.status_parallelism or 1))
     service.processing_parallelism = max(1, int(service.processing_parallelism or 1))
     service.record_retry_cooldown_seconds = max(0, int(service.record_retry_cooldown_seconds or 0))
-    service.upload_recovery_stale_minutes = max(1, int(service.upload_recovery_stale_minutes or 1))
     paths = _build_paths(service.data_dir)
 
     rooms_raw = raw.get("rooms") or []
@@ -286,32 +252,25 @@ def load_config(path: Path) -> AppConfig:
         if value is not None:
             setattr(asr, field_name, float(value))
 
-    danmaku = DanmakuConfig(**(raw.get("danmaku") or {}))
-    danmaku.poll_seconds = max(0.5, float(danmaku.poll_seconds or 2.0))
-    danmaku.request_timeout_seconds = max(1, int(danmaku.request_timeout_seconds or 10))
-    danmaku.display_seconds = max(1.0, float(danmaku.display_seconds or 8.0))
-    danmaku.max_entries = max(0, int(danmaku.max_entries or 0))
-    danmaku.max_text_chars = max(1, int(danmaku.max_text_chars or 80))
-    danmaku.max_user_name_chars = max(1, int(danmaku.max_user_name_chars or 16))
-    danmaku.lane_count = max(1, int(danmaku.lane_count or 1))
-    danmaku.font_size = max(8, int(danmaku.font_size or 28))
-    danmaku.font_opacity = min(1.0, max(0.0, float(danmaku.font_opacity)))
-    danmaku.top_margin = max(0, int(danmaku.top_margin or 0))
-    danmaku.bottom_margin = max(0, int(danmaku.bottom_margin or 0))
+    naming_raw = raw.get("naming") or {}
+    naming = NamingConfig(
+        filename_template=str(
+            naming_raw.get("filename_template")
+            or NamingConfig.filename_template
+        )
+    )
 
     config = AppConfig(
         config_path=path,
         service=service,
         paths=paths,
         rooms=rooms,
-        naming=NamingConfig(**(raw.get("naming") or {})),
+        naming=naming,
         record=record,
         transcode=transcode,
         asr=asr,
         translation=TranslationConfig(**(raw.get("translation") or {})),
         subtitles=SubtitlesConfig(**(raw.get("subtitles") or {})),
-        danmaku=danmaku,
-        upload=UploadConfig(**(raw.get("upload") or {})),
     )
     _ensure_dirs(config.paths)
     return config
@@ -387,8 +346,6 @@ def _build_paths(data_dir: Path) -> PathsConfig:
         raw_dir=data_dir / "raw",
         processed_dir=data_dir / "processed",
         subtitles_dir=data_dir / "subtitles",
-        danmaku_dir=data_dir / "danmaku",
-        upload_dir=data_dir / "upload",
         work_dir=data_dir / "work",
         logs_dir=data_dir / "logs",
         jobs_log=data_dir / "jobs.jsonl",
@@ -401,8 +358,6 @@ def _ensure_dirs(paths: PathsConfig) -> None:
         paths.raw_dir,
         paths.processed_dir,
         paths.subtitles_dir,
-        paths.danmaku_dir,
-        paths.upload_dir,
         paths.work_dir,
         paths.logs_dir,
     ):

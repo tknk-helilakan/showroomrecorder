@@ -164,7 +164,7 @@ class MediaMergeTests(unittest.TestCase):
                 patch("showroomrecorder.media.subprocess.run", return_value=completed),
                 self.assertRaisesRegex(
                     RuntimeError,
-                    r"delta 554\.353s.*file was retained and upload was blocked",
+                    r"delta 554\.353s.*file was retained and processing was stopped",
                 ),
             ):
                 processor.validate_av_sync(media_file)
@@ -175,7 +175,7 @@ class MediaMergeTests(unittest.TestCase):
             root = Path(temp_dir)
             source = root / "processed.mp4"
             subtitle = root / "translated.srt"
-            output = root / "upload.mp4"
+            output = root / "subtitled.mp4"
             source.write_bytes(b"source")
             subtitle.write_text("subtitle", encoding="utf-8")
 

@@ -1,4 +1,4 @@
-name: Build Windows CPU Release
+name: Build Windows CPU Release (Lite)
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
     runs-on: windows-latest
     env:
       PYTHONUTF8: "1"
-      PACKAGE_NAME: showroomrecorder-windows-x64-cpu
+      PACKAGE_NAME: showroomrecorder-lite-windows-x64-cpu
 
     steps:
       - name: Checkout
@@ -69,8 +69,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path `
             (Join-Path $packageRoot "data"), `
             (Join-Path $packageRoot "models\asr"), `
-            (Join-Path $packageRoot "models\translation"), `
-            (Join-Path $packageRoot "tools\biliup") | Out-Null
+            (Join-Path $packageRoot "models\translation") | Out-Null
           Compress-Archive -Path $packageRoot -DestinationPath "$env:PACKAGE_NAME.zip" -Force
 
       - name: Upload workflow artifact

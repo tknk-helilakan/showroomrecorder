@@ -17,7 +17,7 @@ DEFAULT_CONFIG = r"E:\helilokan\Test\showroomrecord\config.yaml"
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="showroomrecorder",
-        description="Watch SHOWROOM rooms, record lives, transcode, subtitle, translate, and upload.",
+        description="Watch SHOWROOM rooms, record lives, transcode, transcribe, and translate subtitles.",
     )
     parser.add_argument(
         "-c",
@@ -33,7 +33,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--process-raw",
         type=Path,
-        help="Process, subtitle, and upload an existing raw recording file.",
+        help="Transcode and generate subtitles for an existing raw recording file.",
     )
     parser.add_argument(
         "--room",
