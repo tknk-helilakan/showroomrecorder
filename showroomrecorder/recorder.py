@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .config import AppConfig, RoomConfig
 from .models import LiveSession
+from .recording_proxy import RecordingProxyResolver, describe_proxy
 from .showroom import ShowroomClient
 from .templating import slugify
 
@@ -21,102 +22,174 @@ class StreamRecorder:
     def __init__(self, config: AppConfig, showroom: ShowroomClient) -> None:
         self.config = config
         self.showroom = showroom
+        self.proxy_resolver = RecordingProxyResolver(config.record.proxy)
 
-    def record(self, session: LiveSession) -> Path:
+    def record(self, session: LiveSession, *, segment_index: int | None = None) -> Path:
         strategy = self.config.record.strategy.lower()
+        capture_dir = self._capture_dir(session, segment_index=segment_index)
         if strategy == "streamlink":
-            return self._record_with_streamlink(session)
+            return self._record_with_streamlink(session, capture_dir=capture_dir)
         if strategy == "yt_dlp":
             urls = self.showroom.get_streaming_urls(session.room)
             if not urls:
                 raise RuntimeError(f"No streaming URL returned for room {session.room.name}")
-            return self._record_with_ytdlp(session, self._ordered_stream_urls(urls)[0])
+            return self._record_with_ytdlp(
+                session,
+                self._ordered_stream_urls(urls)[0],
+                capture_dir=capture_dir,
+            )
         if strategy == "ffmpeg":
-            return self._record_with_ffmpeg(session)
+            return self._record_with_ffmpeg(session, capture_dir=capture_dir)
         raise ValueError(f"Unsupported record.strategy: {self.config.record.strategy}")
 
-    def _record_with_ytdlp(self, session: LiveSession, source_url: str | None = None) -> Path:
+    def _record_with_ytdlp(
+        self,
+        session: LiveSession,
+        source_url: str | None = None,
+        *,
+        capture_dir: Path | None = None,
+    ) -> Path:
         bin_name = self.config.record.yt_dlp_bin
         command_prefix = self._yt_dlp_command_prefix(bin_name)
         room = session.room
-        capture_dir = self._capture_dir(session)
-        output_template = capture_dir / "recording.%(ext)s"
-        command = [
-            *command_prefix,
-            "--newline",
-            "--no-playlist",
-            "--hls-use-mpegts",
-            "--fragment-retries",
-            str(self.config.record.hls_fragment_retries),
-            "-o",
-            str(output_template),
-        ]
-        for header in self._yt_dlp_input_headers():
-            command.extend(["--add-header", header])
-        cookies_file = room.cookies_file or self.config.record.cookies_file
-        if cookies_file:
-            command.extend(["--cookies", str(cookies_file)])
-        if self.config.record.max_seconds:
-            command.extend(
-                [
-                    "--downloader",
-                    "ffmpeg",
-                    "--downloader-args",
-                    f"ffmpeg:-t {self.config.record.max_seconds}",
-                ]
-            )
-        command.extend(self.config.record.extra_args)
-        command.append(source_url or room.url)
-        elapsed = self._run_record_command(command, capture_dir / "yt-dlp.log")
-        recorded_file = self._find_recorded_file(capture_dir)
-        self._write_capture_health_report(recorded_file, elapsed, recorder="yt-dlp")
-        return recorded_file
+        capture_dir = capture_dir or self._capture_dir(session)
+        errors: list[str] = []
+        for route_index, proxy_url in enumerate(self._recording_routes(), start=1):
+            artifact_suffix = self._route_artifact_suffix(route_index, proxy_url)
+            output_template = capture_dir / f"recording{artifact_suffix}.%(ext)s"
+            command = [
+                *command_prefix,
+                "--newline",
+                "--no-playlist",
+                "--hls-use-mpegts",
+                "--fragment-retries",
+                str(self.config.record.hls_fragment_retries),
+                "-o",
+                str(output_template),
+            ]
+            if proxy_url:
+                command.extend(["--proxy", proxy_url])
+            for header in self._yt_dlp_input_headers():
+                command.extend(["--add-header", header])
+            cookies_file = room.cookies_file or self.config.record.cookies_file
+            if cookies_file:
+                command.extend(["--cookies", str(cookies_file)])
+            if self.config.record.max_seconds:
+                command.extend(
+                    [
+                        "--downloader",
+                        "ffmpeg",
+                        "--downloader-args",
+                        f"ffmpeg:-t {self.config.record.max_seconds}",
+                    ]
+                )
+            command.extend(self.config.record.extra_args)
+            command.append(source_url or room.url)
+            log_file = capture_dir / f"yt-dlp{artifact_suffix}.log"
+            LOGGER.info("Trying yt-dlp recording via %s", self._route_label(proxy_url))
+            attempt_started_at = time.monotonic()
+            try:
+                elapsed = self._run_record_command(command, log_file)
+                recorded_file = self._find_recorded_file(
+                    capture_dir,
+                    filename_prefix=f"recording{artifact_suffix}.",
+                )
+                self._write_capture_health_report(recorded_file, elapsed, recorder="yt-dlp")
+                return recorded_file
+            except Exception as exc:  # noqa: BLE001
+                elapsed = max(0.0, time.monotonic() - attempt_started_at)
+                partial = self._find_usable_partial_recording(
+                    capture_dir=capture_dir,
+                    filename_prefix=f"recording{artifact_suffix}.",
+                    wall_duration=elapsed,
+                    recorder="yt-dlp",
+                    command_error=exc,
+                )
+                if partial:
+                    return partial
+                errors.append(f"{self._route_label(proxy_url)}: {exc}")
+                LOGGER.warning(
+                    "yt-dlp recording failed via %s: %s",
+                    self._route_label(proxy_url),
+                    exc,
+                )
 
-    def _record_with_streamlink(self, session: LiveSession) -> Path:
+        raise RuntimeError(f"All yt-dlp network routes failed: {'; '.join(errors[-3:])}")
+
+    def _record_with_streamlink(
+        self,
+        session: LiveSession,
+        *,
+        capture_dir: Path | None = None,
+    ) -> Path:
         urls = self.showroom.get_streaming_urls(session.room)
         if not urls:
             raise RuntimeError(f"No streaming URL returned for room {session.room.name}")
         stream_urls = self._ordered_stream_urls(urls)
-        capture_dir = self._capture_dir(session)
+        capture_dir = capture_dir or self._capture_dir(session)
         errors: list[str] = []
-        for index, stream_url in enumerate(stream_urls, start=1):
-            output_file = capture_dir / f"recording-{index:02d}.ts"
-            if output_file.exists():
-                output_file.unlink()
-            log_file = capture_dir / f"streamlink-record-{index:02d}.log"
-            command = self._streamlink_record_command(stream_url, output_file)
-            LOGGER.info(
-                "Trying SHOWROOM stream URL %d/%d with Streamlink for %s",
-                index,
-                len(stream_urls),
-                session.room.name,
-            )
-            try:
-                elapsed = self._run_record_command(command, log_file)
-                self._write_capture_health_report(output_file, elapsed, recorder="streamlink")
-                recorded_file = self._validate_recorded_file(output_file)
-                return recorded_file
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{stream_url}: {exc}")
-                LOGGER.warning(
-                    "Streamlink recording attempt %d/%d failed for %s: %s",
+        for route_index, proxy_url in enumerate(self._recording_routes(), start=1):
+            artifact_suffix = self._route_artifact_suffix(route_index, proxy_url)
+            for index, stream_url in enumerate(stream_urls, start=1):
+                output_file = capture_dir / f"recording-{index:02d}{artifact_suffix}.ts"
+                if output_file.exists():
+                    output_file.unlink()
+                log_file = capture_dir / f"streamlink-record-{index:02d}{artifact_suffix}.log"
+                command = self._streamlink_record_command(
+                    stream_url,
+                    output_file,
+                    proxy_url=proxy_url,
+                )
+                LOGGER.info(
+                    "Trying SHOWROOM stream URL %d/%d with Streamlink for %s via %s",
                     index,
                     len(stream_urls),
                     session.room.name,
-                    exc,
+                    self._route_label(proxy_url),
                 )
+                attempt_started_at = time.monotonic()
+                try:
+                    elapsed = self._run_record_command(command, log_file)
+                    recorded_file = self._validate_recorded_file(output_file)
+                    self._write_capture_health_report(output_file, elapsed, recorder="streamlink")
+                    return recorded_file
+                except Exception as exc:  # noqa: BLE001
+                    elapsed = max(0.0, time.monotonic() - attempt_started_at)
+                    partial = self._accept_usable_partial_recording(
+                        output_file,
+                        wall_duration=elapsed,
+                        recorder="streamlink",
+                        command_error=exc,
+                    )
+                    if partial:
+                        return partial
+                    errors.append(f"{self._route_label(proxy_url)} {stream_url}: {exc}")
+                    LOGGER.warning(
+                        "Streamlink recording attempt %d/%d failed for %s via %s: %s",
+                        index,
+                        len(stream_urls),
+                        session.room.name,
+                        self._route_label(proxy_url),
+                        exc,
+                    )
 
         if self.config.record.streamlink_fallback_to_ffmpeg:
             LOGGER.warning(
                 "All Streamlink stream URL attempts failed for %s; falling back to FFmpeg",
                 session.room.name,
             )
-            return self._record_with_ffmpeg(session)
+            return self._record_with_ffmpeg(session, capture_dir=capture_dir)
 
         details = "; ".join(errors[-3:])
         raise RuntimeError(f"All Streamlink recording attempts failed for {session.room.name}: {details}")
 
-    def _streamlink_record_command(self, stream_url: str, output_file: Path) -> list[str]:
+    def _streamlink_record_command(
+        self,
+        stream_url: str,
+        output_file: Path,
+        *,
+        proxy_url: str | None = None,
+    ) -> list[str]:
         command = [
             *self._streamlink_command_prefix(self.config.record.streamlink_bin),
             "--loglevel",
@@ -129,6 +202,8 @@ class StreamRecorder:
             "--stream-segment-attempts",
             str(max(1, self.config.record.hls_fragment_retries)),
         ]
+        if proxy_url:
+            command.extend(["--http-proxy", proxy_url])
         for header in self._streamlink_input_headers():
             command.extend(["--http-header", header])
         if self.config.record.max_seconds:
@@ -137,51 +212,84 @@ class StreamRecorder:
         command.extend([stream_url, "best"])
         return command
 
-    def _record_with_ffmpeg(self, session: LiveSession) -> Path:
+    def _record_with_ffmpeg(
+        self,
+        session: LiveSession,
+        *,
+        capture_dir: Path | None = None,
+    ) -> Path:
         urls = self.showroom.get_streaming_urls(session.room)
         if not urls:
             raise RuntimeError(f"No streaming URL returned for room {session.room.name}")
         stream_urls = self._ordered_stream_urls(urls)
-        capture_dir = self._capture_dir(session)
+        capture_dir = capture_dir or self._capture_dir(session)
         errors: list[str] = []
-        for index, stream_url in enumerate(stream_urls, start=1):
-            output_file = capture_dir / f"recording-{index:02d}.ts"
-            if output_file.exists():
-                output_file.unlink()
-            log_file = capture_dir / f"ffmpeg-record-{index:02d}.log"
-            command = self._ffmpeg_record_command(stream_url, output_file)
-            LOGGER.info(
-                "Trying SHOWROOM stream URL %d/%d for %s",
-                index,
-                len(stream_urls),
-                session.room.name,
-            )
-            try:
-                elapsed = self._run_record_command(command, log_file)
-                self._write_capture_health_report(output_file, elapsed, recorder="ffmpeg")
-                recorded_file = self._validate_recorded_file(output_file)
-                return recorded_file
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{stream_url}: {exc}")
-                LOGGER.warning(
-                    "FFmpeg recording attempt %d/%d failed for %s: %s",
+        for route_index, proxy_url in enumerate(self._recording_routes(), start=1):
+            artifact_suffix = self._route_artifact_suffix(route_index, proxy_url)
+            for index, stream_url in enumerate(stream_urls, start=1):
+                output_file = capture_dir / f"recording-{index:02d}{artifact_suffix}.ts"
+                if output_file.exists():
+                    output_file.unlink()
+                log_file = capture_dir / f"ffmpeg-record-{index:02d}{artifact_suffix}.log"
+                command = self._ffmpeg_record_command(
+                    stream_url,
+                    output_file,
+                    proxy_url=proxy_url,
+                )
+                LOGGER.info(
+                    "Trying SHOWROOM stream URL %d/%d for %s via %s",
                     index,
                     len(stream_urls),
                     session.room.name,
-                    exc,
+                    self._route_label(proxy_url),
                 )
+                attempt_started_at = time.monotonic()
+                try:
+                    elapsed = self._run_record_command(command, log_file)
+                    recorded_file = self._validate_recorded_file(output_file)
+                    self._write_capture_health_report(output_file, elapsed, recorder="ffmpeg")
+                    return recorded_file
+                except Exception as exc:  # noqa: BLE001
+                    elapsed = max(0.0, time.monotonic() - attempt_started_at)
+                    partial = self._accept_usable_partial_recording(
+                        output_file,
+                        wall_duration=elapsed,
+                        recorder="ffmpeg",
+                        command_error=exc,
+                    )
+                    if partial:
+                        return partial
+                    errors.append(f"{self._route_label(proxy_url)} {stream_url}: {exc}")
+                    LOGGER.warning(
+                        "FFmpeg recording attempt %d/%d failed for %s via %s: %s",
+                        index,
+                        len(stream_urls),
+                        session.room.name,
+                        self._route_label(proxy_url),
+                        exc,
+                    )
 
         if self.config.record.ffmpeg_fallback_to_ytdlp:
             try:
                 LOGGER.warning("All FFmpeg stream URL attempts failed for %s; falling back to yt-dlp", session.room.name)
-                return self._record_with_ytdlp(session, stream_urls[0])
+                return self._record_with_ytdlp(
+                    session,
+                    stream_urls[0],
+                    capture_dir=capture_dir,
+                )
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"yt-dlp fallback: {exc}")
 
         details = "; ".join(errors[-3:])
         raise RuntimeError(f"All recording attempts failed for {session.room.name}: {details}")
 
-    def _ffmpeg_record_command(self, stream_url: str, output_file: Path) -> list[str]:
+    def _ffmpeg_record_command(
+        self,
+        stream_url: str,
+        output_file: Path,
+        *,
+        proxy_url: str | None = None,
+    ) -> list[str]:
         command = [
             self.config.transcode.ffmpeg_bin,
             "-hide_banner",
@@ -199,9 +307,10 @@ class StreamRecorder:
             "1",
             "-seg_max_retry",
             str(self.config.record.hls_fragment_retries),
-            "-i",
-            stream_url,
         ]
+        if proxy_url:
+            command.extend(["-http_proxy", proxy_url])
+        command.extend(["-i", stream_url])
         if self.config.record.max_seconds:
             command.extend(["-t", str(self.config.record.max_seconds)])
         command.extend(
@@ -252,8 +361,10 @@ class StreamRecorder:
                 values.append(f"{cookie.name}={cookie.value}")
         return "; ".join(values)
 
-    def _capture_dir(self, session: LiveSession) -> Path:
+    def _capture_dir(self, session: LiveSession, *, segment_index: int | None = None) -> Path:
         directory = self.config.paths.raw_dir / slugify(session.room.name) / session.job_id
+        if segment_index is not None:
+            directory = directory / "segments" / f"{max(1, int(segment_index)):04d}"
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
@@ -280,11 +391,17 @@ class StreamRecorder:
             raise RuntimeError(f"Recording command failed with exit code {code}. See log: {log_file}")
         return elapsed
 
-    def _find_recorded_file(self, capture_dir: Path) -> Path:
+    def _find_recorded_file(
+        self,
+        capture_dir: Path,
+        *,
+        filename_prefix: str | None = None,
+    ) -> Path:
         candidates = [
             item
             for item in capture_dir.iterdir()
             if item.is_file()
+            and (filename_prefix is None or item.name.startswith(filename_prefix))
             and item.suffix.lower() not in {".log", ".part", ".ytdl", ".json"}
             and not item.name.endswith(".part-Frag")
         ]
@@ -292,6 +409,62 @@ class StreamRecorder:
             raise RuntimeError(f"No recording output found in {capture_dir}")
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return self._validate_recorded_file(candidates[0])
+
+    def _find_usable_partial_recording(
+        self,
+        *,
+        capture_dir: Path,
+        filename_prefix: str,
+        wall_duration: float,
+        recorder: str,
+        command_error: Exception,
+    ) -> Path | None:
+        try:
+            media_file = self._find_recorded_file(
+                capture_dir,
+                filename_prefix=filename_prefix,
+            )
+        except (OSError, RuntimeError):
+            return None
+        return self._accept_usable_partial_recording(
+            media_file,
+            wall_duration=wall_duration,
+            recorder=recorder,
+            command_error=command_error,
+            already_validated=True,
+        )
+
+    def _accept_usable_partial_recording(
+        self,
+        media_file: Path,
+        *,
+        wall_duration: float,
+        recorder: str,
+        command_error: Exception,
+        already_validated: bool = False,
+    ) -> Path | None:
+        if not media_file.exists():
+            return None
+        try:
+            recorded_file = (
+                media_file if already_validated else self._validate_recorded_file(media_file)
+            )
+        except (OSError, RuntimeError):
+            return None
+
+        LOGGER.warning(
+            "Keeping usable partial %s segment after command failure: %s",
+            recorder,
+            command_error,
+        )
+        self._write_capture_health_report(
+            recorded_file,
+            wall_duration,
+            recorder=recorder,
+            command_succeeded=False,
+            command_error=str(command_error),
+        )
+        return recorded_file
 
     def _validate_recorded_file(self, selected: Path) -> Path:
         min_bytes = int(self.config.record.min_file_size_mb * 1024 * 1024)
@@ -349,28 +522,51 @@ class StreamRecorder:
             return None
         return duration
 
+    def probe_duration(self, media_file: Path) -> float | None:
+        return self._probe_duration(media_file)
+
+    def read_capture_health_report(self, media_file: Path) -> dict:
+        report_file = media_file.with_suffix(media_file.suffix + ".capture.json")
+        try:
+            payload = json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
     def _write_capture_health_report(
         self,
         media_file: Path,
         wall_duration: float,
         *,
         recorder: str,
+        command_succeeded: bool = True,
+        command_error: str | None = None,
     ) -> None:
         media_duration = self._probe_duration(media_file)
+        captured_at = time.time()
         ratio = media_duration / wall_duration if media_duration is not None and wall_duration > 0 else None
         threshold = self.config.record.capture_realtime_ratio_warning
         degraded = ratio is not None and threshold > 0 and ratio < threshold
         report = {
             "recorder": recorder,
             "media_file": str(media_file),
+            "capture_started_at": round(captured_at - max(0.0, wall_duration), 3),
+            "capture_ended_at": round(captured_at, 3),
             "wall_duration_seconds": round(wall_duration, 3),
             "media_duration_seconds": round(media_duration, 3) if media_duration is not None else None,
             "realtime_ratio": round(ratio, 6) if ratio is not None else None,
             "warning_threshold": threshold,
             "degraded": degraded,
+            "partial": not command_succeeded,
+            "command_succeeded": command_succeeded,
+            "command_error": command_error,
         }
         report_file = media_file.with_suffix(media_file.suffix + ".capture.json")
-        report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            LOGGER.warning("Could not save capture health report for %s: %s", media_file, exc)
+            return
         if degraded:
             LOGGER.warning(
                 "Capture health degraded for %s: media %.2fs / wall %.2fs = %.3f (< %.3f)",
@@ -410,6 +606,26 @@ class StreamRecorder:
         ordered.extend(url for url in urls if url not in ordered)
         return ordered or urls
 
+    def _recording_routes(self) -> list[str | None]:
+        resolver = getattr(self, "proxy_resolver", None)
+        if resolver is None:
+            proxy_config = getattr(self.config.record, "proxy", None)
+            if proxy_config is None:
+                return [None]
+            resolver = RecordingProxyResolver(proxy_config)
+            self.proxy_resolver = resolver
+        return resolver.routes()
+
+    def _route_artifact_suffix(self, route_index: int, proxy_url: str | None) -> str:
+        if proxy_url is None:
+            return ""
+        return f"-proxy{route_index:02d}"
+
+    def _route_label(self, proxy_url: str | None) -> str:
+        if proxy_url is None:
+            return "system/direct route"
+        return describe_proxy(proxy_url)
+
     def _format_command_for_log(self, command: list[str]) -> str:
         redacted: list[str] = []
         for index, item in enumerate(command):
@@ -427,6 +643,12 @@ class StreamRecorder:
                 and item.lower().startswith("cookie=")
             ):
                 redacted.append("Cookie=<redacted>")
+            elif index > 0 and command[index - 1] in {
+                "--http-proxy",
+                "--proxy",
+                "-http_proxy",
+            }:
+                redacted.append(describe_proxy(item))
             else:
                 redacted.append(item)
         return " ".join(redacted)

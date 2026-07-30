@@ -6,7 +6,7 @@
 
 - 轮询 SHOWROOM 直播间开播状态。
 - 开播后调用 `yt-dlp` 录制直播流到本地。
-- 调用 `ffmpeg` 转码为指定帧率和分辨率的 MP4。
+- 调用 `ffmpeg` 保留源时间戳并转码为指定分辨率的 MP4。
 - 可选捕获 SHOWROOM 弹幕，保存 `.danmaku.ass` / `.danmaku.jsonl`，并在转码时同步烧进画面。
 - 调用 OpenAI Audio transcription API 做日语语音识别，生成 `.ja.srt`。
 - 支持多种翻译后端生成 `.zh.srt`：
@@ -89,7 +89,7 @@ python -m showroomrecorder --config config.yaml
 
 默认会在 `data\` 下生成：
 
-- `raw`：原始录制文件。
+- `raw`：同一直播任务的原始分段、FFconcat 清单和合并后的录制文件。
 - `processed`：转码后的 MP4。
 - `subtitles`：日语和中文字幕。
 - `danmaku`：弹幕 JSONL 和 ASS 文件。
@@ -100,9 +100,13 @@ python -m showroomrecorder --config config.yaml
 
 服务启动后会为 `rooms` 中每个启用的直播间建立一个监听任务。多个直播间可以同时监听；如果多个房间同时开播，也可以同时录制。
 
-录制结束后，任务会进入处理队列，按顺序执行：
+一次直播只对应一个逻辑任务。Streamlink/FFmpeg 因 403、超时或暂时没有新分片而退出时，服务会重新查询房间状态和最新播放地址；只要房间仍在线，就在同一个 `job_id` 下继续写入下一个分段。连续达到 `record.live_end_confirmations` 次下线确认后，才结束弹幕捕获并结算任务。
 
+直播确认结束后，任务会进入处理队列，按顺序执行：
+
+- 按录制顺序合并原始分段并重建连续时间戳
 - 转码 MP4
+- 用 `ffprobe` 校验音视频流结束时间，异常成品保留在本地但不上传
 - 如果启用弹幕烧录，转码时把 `.danmaku.ass` 同步显示在画面中
 - 日语语音识别
 - 翻译中文字幕并生成字幕文件
@@ -112,6 +116,52 @@ python -m showroomrecorder --config config.yaml
 默认 `service.processing_parallelism: 1`，所以识别、翻译、压字幕、上传会一个一个完成。你可以监听和录制多个直播间，但后处理队列保持串行，避免同时跑多个大模型或上传任务。
 
 ## 常见配置说明
+
+### 断流重连和直播结束确认
+
+```yaml
+record:
+  reconnect_delay_seconds: 5
+  live_end_confirmations: 4
+  live_end_check_interval_seconds: 20
+  hls_concurrent_fragments: 2
+```
+
+默认在录制进程退出后等待 5 秒重连。房间首次显示下线后，每 20 秒复查一次，连续 4 次确认下线（总计约 60 秒）才结束同一逻辑任务，因此短暂断流或主播快速重连不会产生多个独立上传。各段保存在 `raw/<主播>/<job_id>/segments/`，随后逐段重建从零开始的音视频 PTS，再通过 FFmpeg concat filter 合并为连续时间轴。`hls_concurrent_fragments` 默认使用 2，避免对 SHOWROOM CDN 发起过多并行分片请求。
+
+弹幕 JSONL 保留原始墙钟时间；生成 ASS 时会按每段录制的实际媒体时长映射到合并后的视频时间轴。断流期间没有对应画面的评论不会烧录到后续片段上。
+
+### 转码时间戳和音画校验
+
+```yaml
+transcode:
+  fps:
+  ffprobe_bin: ffprobe
+  validate_av_sync: true
+  max_av_desync_seconds: 3
+```
+
+SHOWROOM 的 MPEG-TS 元数据可能把实际约 30fps 的画面标成 20fps。`fps` 留空时程序按源 PTS 做 VFR 编码，不会使用名义帧率重算每一帧的时间。合并、转码、硬字幕输出以及上传恢复前都会比较视频流和音频流的结束时间；差值超过阈值时任务失败并停止上传，原始分段、合并文件、成品和 FFmpeg 日志都会保留用于检查。
+
+### 录制代理回退
+
+`record.proxy` 只作用于直播流下载，会同时传给 Streamlink、FFmpeg 和 yt-dlp，不会改变 Bilibili 上传线路。`mode: auto` 的顺序是：Windows 显式系统代理、当前系统/TUN 路由、项目代理。这样系统代理或 TUN 正常时保持原线路，直连录制失败后才使用项目代理。
+
+```yaml
+record:
+  proxy:
+    enabled: true
+    mode: "auto"
+    include_system: true
+    urls:
+      - "http://127.0.0.1:7897"
+    file: ""
+    source_url: ""
+```
+
+`urls`、`file` 和 `source_url` 可提供一个或多个 HTTP 代理端点。文件和远程内容支持 YAML、JSON、逐行文本以及 Base64 编码的端点列表；程序会探测并优先使用可用端点，远程列表的最后一次有效内容会写入 `cache_file`。
+
+当前只接受 `http://` 或 `https://` 代理端点，不直接解析 `ss://`、`vmess://`、`trojan://` 等节点订阅。使用 Clash/Mihomo 时应让核心保持运行，并把它的本地 mixed-port（例如 `http://127.0.0.1:7897`）填入 `urls`；关闭系统代理或 TUN 开关不会影响该本地端口。
 
 ### OpenAI 转写和翻译
 
@@ -313,6 +363,8 @@ upload:
     subtitle_language: zh
     subtitle_page_wait_seconds: 900
     subtitle_page_poll_seconds: 30
+    subtitle_save_attempts: 3
+    subtitle_save_retry_seconds: 5
     subtitle_errors_fatal: true
 ```
 

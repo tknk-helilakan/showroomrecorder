@@ -79,7 +79,11 @@ class BiliupUploader:
                     user_cookie=user_cookie,
                     part_title=part_title,
                 )
-            subtitle_part_titles = self._subtitle_part_title_candidates(session, part_title)
+            subtitle_part_titles = self._subtitle_part_title_candidates(
+                session,
+                part_title,
+                use_upload_file_title_only=use_small_chunks,
+            )
             prefer_last_part = True
         elif mode in {"monthly", "auto_monthly", "monthly_append"}:
             monthly_bvid = self._resolve_monthly_vid(session)
@@ -99,7 +103,11 @@ class BiliupUploader:
                         part_title=part_title,
                         vid=monthly_bvid,
                     )
-                subtitle_part_titles = self._subtitle_part_title_candidates(session, part_title)
+                subtitle_part_titles = self._subtitle_part_title_candidates(
+                    session,
+                    part_title,
+                    use_upload_file_title_only=use_small_chunks,
+                )
                 prefer_last_part = True
             else:
                 if use_small_chunks:
@@ -113,7 +121,11 @@ class BiliupUploader:
                 if not bvid:
                     raise RuntimeError("Biliup upload succeeded but no BVID was detected; cannot remember monthly submission")
                 self._remember_monthly_vid(session, bvid)
-                subtitle_part_titles = self._subtitle_part_title_candidates(session, None)
+                subtitle_part_titles = self._subtitle_part_title_candidates(
+                    session,
+                    None,
+                    use_upload_file_title_only=use_small_chunks,
+                )
                 prefer_last_part = True
         elif mode == "upload":
             if use_small_chunks:
@@ -147,6 +159,8 @@ class BiliupUploader:
                     trust_env=bool(biliup_cfg.get("trust_env", False)),
                     page_wait_seconds=int(biliup_cfg.get("subtitle_page_wait_seconds") or 900),
                     page_poll_seconds=int(biliup_cfg.get("subtitle_page_poll_seconds") or 30),
+                    save_attempts=int(biliup_cfg.get("subtitle_save_attempts") or 3),
+                    save_retry_seconds=int(biliup_cfg.get("subtitle_save_retry_seconds") or 5),
                 ).upload(
                     bvid,
                     segments,
@@ -412,11 +426,17 @@ class BiliupUploader:
             },
         }
 
-    def _subtitle_part_title_candidates(self, session: LiveSession, part_title: str | None) -> list[str]:
+    def _subtitle_part_title_candidates(
+        self,
+        session: LiveSession,
+        part_title: str | None,
+        *,
+        use_upload_file_title_only: bool = False,
+    ) -> list[str]:
         candidates: list[str] = []
         if session.upload_file:
             candidates.append(session.upload_file.stem)
-        if part_title:
+        if part_title and not use_upload_file_title_only:
             candidates.append(part_title)
             candidates.append(part_title.replace(" ", "_"))
         return list(dict.fromkeys(item.strip() for item in candidates if item.strip()))
@@ -935,11 +955,15 @@ class SubtitleDraftUploader:
         trust_env: bool = False,
         page_wait_seconds: int = 900,
         page_poll_seconds: int = 30,
+        save_attempts: int = 3,
+        save_retry_seconds: int = 5,
     ) -> None:
         self.cookie_file = cookie_file
         self.language = language
         self.page_wait_seconds = max(0, page_wait_seconds)
         self.page_poll_seconds = max(1, page_poll_seconds)
+        self.save_attempts = max(1, save_attempts)
+        self.save_retry_seconds = max(0, save_retry_seconds)
         self.session = requests.Session()
         self.session.trust_env = trust_env
         self.session.headers.update(
@@ -976,9 +1000,8 @@ class SubtitleDraftUploader:
         if not csrf:
             raise RuntimeError("Cookie does not contain bili_jct csrf token")
         data = to_bilibili_subtitle_json(segments, max_end=_page_duration(page))
-        response = self.session.post(
-            self.ENDPOINT,
-            data={
+        self._save_draft(
+            {
                 "aid": aid,
                 "bvid": bvid,
                 "type": 1,
@@ -988,14 +1011,36 @@ class SubtitleDraftUploader:
                 "data": json.dumps(data, ensure_ascii=False),
                 "submit": "true",
                 "csrf": csrf,
-            },
-            timeout=60,
+            }
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise RuntimeError(f"Bilibili subtitle API returned: {payload}")
         LOGGER.info("Bilibili subtitle draft uploaded for %s cid=%s", bvid, cid)
+
+    def _save_draft(self, request_data: dict[str, Any]) -> None:
+        for attempt in range(1, self.save_attempts + 1):
+            try:
+                response = self.session.post(
+                    self.ENDPOINT,
+                    data=request_data,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except requests.RequestException as exc:
+                if attempt >= self.save_attempts:
+                    raise
+                delay = min(30, self.save_retry_seconds * attempt)
+                LOGGER.warning(
+                    "Bilibili subtitle draft save attempt %d/%d failed; retrying in %d second(s): %s",
+                    attempt,
+                    self.save_attempts,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+                continue
+            if payload.get("code") != 0:
+                raise RuntimeError(f"Bilibili subtitle API returned: {payload}")
+            return
 
     def _get_cid(
         self,

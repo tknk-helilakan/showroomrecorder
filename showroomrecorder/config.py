@@ -54,6 +54,21 @@ class NamingConfig:
 
 
 @dataclass
+class RecordProxyConfig:
+    enabled: bool = False
+    mode: str = "auto"
+    include_system: bool = True
+    urls: list[str] = field(default_factory=list)
+    file: Path | None = None
+    source_url: str = ""
+    cache_file: Path | None = None
+    probe_url: str = "https://www.showroom-live.com/api/live/onlives"
+    probe_timeout_seconds: float = 5.0
+    source_timeout_seconds: float = 15.0
+    refresh_seconds: int = 300
+
+
+@dataclass
 class RecordConfig:
     strategy: str = "streamlink"
     yt_dlp_bin: str = "yt-dlp"
@@ -66,15 +81,20 @@ class RecordConfig:
     max_seconds: int | None = None
     ffmpeg_fallback_to_ytdlp: bool = True
     streamlink_fallback_to_ffmpeg: bool = True
-    hls_concurrent_fragments: int = 8
+    reconnect_delay_seconds: float = 5.0
+    live_end_confirmations: int = 4
+    live_end_check_interval_seconds: float = 20.0
+    hls_concurrent_fragments: int = 2
     hls_fragment_retries: int = 5
     capture_realtime_ratio_warning: float = 0.95
+    proxy: RecordProxyConfig = field(default_factory=RecordProxyConfig)
 
 
 @dataclass
 class TranscodeConfig:
     enabled: bool = True
     ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = ""
     width: int | None = 1920
     height: int | None = 1080
     fps: int | None = None
@@ -85,6 +105,8 @@ class TranscodeConfig:
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
     extra_args: list[str] = field(default_factory=list)
+    validate_av_sync: bool = True
+    max_av_desync_seconds: float = 3.0
 
 
 @dataclass
@@ -215,10 +237,19 @@ def load_config(path: Path) -> AppConfig:
     if not rooms:
         raise ValueError("No enabled rooms configured. Edit rooms in config.yaml.")
 
-    record = RecordConfig(**(raw.get("record") or {}))
+    record_raw = dict(raw.get("record") or {})
+    proxy_raw = record_raw.pop("proxy", None)
+    record = RecordConfig(**record_raw)
+    record.proxy = _parse_record_proxy(proxy_raw, base_dir, paths.data_dir)
     record.cookies_file = _optional_path(base_dir, record.cookies_file)
     record.min_file_size_mb = max(0.0, float(record.min_file_size_mb or 0.0))
     record.min_duration_seconds = max(0.0, float(record.min_duration_seconds or 0.0))
+    record.reconnect_delay_seconds = max(0.0, float(record.reconnect_delay_seconds or 0.0))
+    record.live_end_confirmations = max(1, int(record.live_end_confirmations or 1))
+    record.live_end_check_interval_seconds = max(
+        1.0,
+        float(record.live_end_check_interval_seconds or 1.0),
+    )
     record.hls_concurrent_fragments = min(
         10,
         max(1, int(record.hls_concurrent_fragments or 1)),
@@ -227,6 +258,13 @@ def load_config(path: Path) -> AppConfig:
     record.capture_realtime_ratio_warning = min(
         1.0,
         max(0.0, float(record.capture_realtime_ratio_warning or 0.0)),
+    )
+
+    transcode = TranscodeConfig(**(raw.get("transcode") or {}))
+    transcode.ffprobe_bin = str(transcode.ffprobe_bin or "").strip()
+    transcode.max_av_desync_seconds = max(
+        0.1,
+        float(transcode.max_av_desync_seconds or 3.0),
     )
 
     asr = AsrConfig(**(raw.get("asr") or {}))
@@ -268,7 +306,7 @@ def load_config(path: Path) -> AppConfig:
         rooms=rooms,
         naming=NamingConfig(**(raw.get("naming") or {})),
         record=record,
-        transcode=TranscodeConfig(**(raw.get("transcode") or {})),
+        transcode=transcode,
         asr=asr,
         translation=TranslationConfig(**(raw.get("translation") or {})),
         subtitles=SubtitlesConfig(**(raw.get("subtitles") or {})),
@@ -293,6 +331,54 @@ def _parse_room(raw: dict[str, Any], service: ServiceConfig, base_dir: Path) -> 
     if room.room_id is not None:
         room.room_id = int(room.room_id)
     return room
+
+
+def _parse_record_proxy(
+    raw: dict[str, Any] | None,
+    base_dir: Path,
+    data_dir: Path,
+) -> RecordProxyConfig:
+    if raw is None:
+        return RecordProxyConfig(cache_file=data_dir / "proxy" / "recording-proxies.cache")
+    if not isinstance(raw, dict):
+        raise ValueError("record.proxy must be a mapping")
+
+    urls_raw = raw.get("urls") or []
+    if isinstance(urls_raw, str):
+        urls = [urls_raw.strip()] if urls_raw.strip() else []
+    elif isinstance(urls_raw, list):
+        urls = [str(value).strip() for value in urls_raw if str(value).strip()]
+    else:
+        raise ValueError("record.proxy.urls must be a string or list")
+
+    mode = str(raw.get("mode", "auto") or "auto").strip().lower()
+    if mode == "fallback":
+        mode = "auto"
+    if mode not in {"auto", "proxy_only", "off"}:
+        raise ValueError("record.proxy.mode must be 'auto', 'proxy_only', or 'off'")
+
+    cache_value = raw.get("cache_file")
+    cache_file = (
+        _optional_path(base_dir, cache_value)
+        if cache_value not in (None, "")
+        else data_dir / "proxy" / "recording-proxies.cache"
+    )
+    return RecordProxyConfig(
+        enabled=bool(raw.get("enabled", False)),
+        mode=mode,
+        include_system=bool(raw.get("include_system", True)),
+        urls=urls,
+        file=_optional_path(base_dir, raw.get("file")),
+        source_url=str(raw.get("source_url", "") or "").strip(),
+        cache_file=cache_file,
+        probe_url=str(
+            raw.get("probe_url", "https://www.showroom-live.com/api/live/onlives")
+            or "https://www.showroom-live.com/api/live/onlives"
+        ).strip(),
+        probe_timeout_seconds=max(0.5, float(raw.get("probe_timeout_seconds", 5.0) or 5.0)),
+        source_timeout_seconds=max(1.0, float(raw.get("source_timeout_seconds", 15.0) or 15.0)),
+        refresh_seconds=max(0, int(raw.get("refresh_seconds", 300) or 0)),
+    )
 
 
 def _build_paths(data_dir: Path) -> PathsConfig:

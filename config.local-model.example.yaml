@@ -30,15 +30,34 @@ record:
   min_file_size_mb: 0.1
   min_duration_seconds: 10
   ffmpeg_fallback_to_ytdlp: true
+  reconnect_delay_seconds: 5
+  live_end_confirmations: 4
+  live_end_check_interval_seconds: 20
+  hls_concurrent_fragments: 2
+  proxy:
+    enabled: false
+    mode: "auto" # auto | proxy_only | off
+    include_system: true
+    urls:
+      - "http://127.0.0.1:7897"
+    file: ""
+    source_url: ""
+    cache_file: "data/proxy/recording-proxies.cache"
+    probe_url: "https://www.showroom-live.com/api/live/onlives"
+    probe_timeout_seconds: 5
+    source_timeout_seconds: 15
+    refresh_seconds: 300
   # Optional test-only limit. Leave empty/null for normal full-live recording.
   max_seconds:
 
 transcode:
   enabled: true
   ffmpeg_bin: "ffmpeg"
+  ffprobe_bin: "ffprobe"
   width: 1280
   height: 720
-  fps: 30
+  # Empty preserves source timestamps and avoids frame-rate-induced A/V drift.
+  fps:
   scale_mode: "fit"
   video_codec: "libx264"
   preset: "veryfast"
@@ -46,6 +65,8 @@ transcode:
   audio_codec: "aac"
   audio_bitrate: "128k"
   extra_args: []
+  validate_av_sync: true
+  max_av_desync_seconds: 3
 
 asr:
   enabled: true
@@ -149,5 +170,7 @@ upload:
     upload_subtitle_draft: false
     subtitle_page_wait_seconds: 900
     subtitle_page_poll_seconds: 30
+    subtitle_save_attempts: 3
+    subtitle_save_retry_seconds: 5
     subtitle_errors_fatal: true
     extra_args: []

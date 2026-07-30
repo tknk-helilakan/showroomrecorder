@@ -178,6 +178,78 @@ class YtDlpFallbackTests(unittest.TestCase):
         self.assertIn("Referer=https://www.showroom-live.com/", command)
         self.assertEqual(command[-2:], ["https://cdn.example/live/test.m3u8", "best"])
 
+    def test_capture_directory_isolated_by_logical_segment(self) -> None:
+        recorder = object.__new__(StreamRecorder)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder.config = SimpleNamespace(paths=SimpleNamespace(raw_dir=Path(temp_dir)))
+            session = SimpleNamespace(
+                room=SimpleNamespace(name="test-room"),
+                job_id="test-job",
+            )
+
+            first = recorder._capture_dir(session, segment_index=1)
+            second = recorder._capture_dir(session, segment_index=2)
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parts[-2:], ("segments", "0001"))
+        self.assertEqual(second.parts[-2:], ("segments", "0002"))
+
+    def test_streamlink_keeps_valid_partial_segment_after_command_failure(self) -> None:
+        recorder = object.__new__(StreamRecorder)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder.config = SimpleNamespace(
+                record=SimpleNamespace(
+                    streamlink_bin="streamlink",
+                    streamlink_extra_args=[],
+                    hls_concurrent_fragments=2,
+                    hls_fragment_retries=5,
+                    max_seconds=None,
+                    streamlink_fallback_to_ffmpeg=True,
+                ),
+                paths=SimpleNamespace(raw_dir=Path(temp_dir)),
+            )
+            recorder.showroom = SimpleNamespace(
+                get_streaming_urls=lambda _room: ["https://cdn.example/live_main_mm.m3u8"],
+                session=SimpleNamespace(cookies=[]),
+            )
+            recorder.proxy_resolver = SimpleNamespace(routes=lambda: [None, "http://127.0.0.1:7897"])
+            session = SimpleNamespace(
+                room=SimpleNamespace(name="test-room"),
+                job_id="test-job",
+            )
+
+            def fail_after_writing(command: list[str], _log_file: Path) -> float:
+                output_file = Path(command[command.index("--output") + 1])
+                output_file.write_bytes(b"usable partial recording")
+                raise RuntimeError("stream read timeout")
+
+            with patch.object(
+                recorder,
+                "_streamlink_command_prefix",
+                return_value=["showroomrecorder.exe", "--streamlink-worker"],
+            ), patch.object(
+                recorder,
+                "_run_record_command",
+                side_effect=fail_after_writing,
+            ) as run_command, patch.object(
+                recorder,
+                "_validate_recorded_file",
+                side_effect=lambda path: path,
+            ), patch.object(
+                recorder,
+                "_write_capture_health_report",
+            ) as health_report, patch.object(
+                recorder,
+                "_record_with_ffmpeg",
+            ) as ffmpeg_fallback:
+                result = recorder._record_with_streamlink(session)
+
+        self.assertEqual(result.name, "recording-01.ts")
+        self.assertEqual(run_command.call_count, 1)
+        ffmpeg_fallback.assert_not_called()
+        self.assertFalse(health_report.call_args.kwargs["command_succeeded"])
+        self.assertIn("stream read timeout", health_report.call_args.kwargs["command_error"])
+
     def test_ffmpeg_failures_fall_back_to_direct_stream_url(self) -> None:
         recorder = object.__new__(StreamRecorder)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -219,6 +291,7 @@ class YtDlpFallbackTests(unittest.TestCase):
         ytdlp_record.assert_called_once_with(
             session,
             "https://cdn.example/live/test_main_mm.m3u8",
+            capture_dir=Path(temp_dir) / "test-room" / "test-job",
         )
 
     def test_ffmpeg_hls_command_enables_parallel_requests_and_segment_retries(self) -> None:

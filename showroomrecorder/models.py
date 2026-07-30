@@ -17,6 +17,15 @@ class SubtitleSegment:
     translation: str | None = None
 
 
+@dataclass(frozen=True)
+class RecordingSegment:
+    index: int
+    file: Path
+    started_at: datetime
+    ended_at: datetime
+    media_duration: float
+
+
 @dataclass
 class LiveSession:
     room: RoomConfig
@@ -26,6 +35,7 @@ class LiveSession:
     work_dir: Path
     ended_at: datetime | None = None
     raw_file: Path | None = None
+    raw_segments: list[Path] = field(default_factory=list)
     mp4_file: Path | None = None
     ja_srt_file: Path | None = None
     zh_srt_file: Path | None = None

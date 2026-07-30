@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -34,6 +34,7 @@ class DanmakuCaptureResult:
     ass_file: Path | None
     jsonl_file: Path | None
     count: int
+    rendered_count: int = 0
 
 
 class DanmakuRecorder:
@@ -44,7 +45,7 @@ class DanmakuRecorder:
     def capture(self, session: LiveSession, stop_event: Event) -> DanmakuCaptureResult:
         cfg = self.config.danmaku
         if not cfg.enabled:
-            return DanmakuCaptureResult(ass_file=None, jsonl_file=None, count=0)
+            return DanmakuCaptureResult(ass_file=None, jsonl_file=None, count=0, rendered_count=0)
 
         output_dir = self.config.paths.danmaku_dir / slugify(session.room.name) / session.job_id
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -99,14 +100,51 @@ class DanmakuRecorder:
             )
 
         entries.sort(key=lambda item: (item.offset, item.index))
-        self.write_ass(ass_file, entries)
+        rendered_entries = self._entries_for_recording_timeline(session, entries)
+        self.write_ass(ass_file, rendered_entries)
         LOGGER.info(
-            "Danmaku capture saved %d comment(s): jsonl=%s ass=%s",
+            "Danmaku capture saved %d comment(s), rendered %d on the media timeline: jsonl=%s ass=%s",
             len(entries),
+            len(rendered_entries),
             jsonl_file,
             ass_file,
         )
-        return DanmakuCaptureResult(ass_file=ass_file, jsonl_file=jsonl_file, count=len(entries))
+        return DanmakuCaptureResult(
+            ass_file=ass_file,
+            jsonl_file=jsonl_file,
+            count=len(entries),
+            rendered_count=len(rendered_entries),
+        )
+
+    def _entries_for_recording_timeline(
+        self,
+        session: LiveSession,
+        entries: list[DanmakuEntry],
+    ) -> list[DanmakuEntry]:
+        timeline = session.metadata.get("recording_timeline")
+        if not isinstance(timeline, list) or not timeline:
+            return entries
+
+        mapped: list[DanmakuEntry] = []
+        for entry in entries:
+            for segment in timeline:
+                if not isinstance(segment, dict):
+                    continue
+                try:
+                    wall_start = float(segment["wall_start"])
+                    wall_end = float(segment["wall_end"])
+                    media_start = float(segment["media_start"])
+                    media_end = float(segment["media_end"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if entry.offset < wall_start or entry.offset > wall_end:
+                    continue
+                wall_duration = max(0.001, wall_end - wall_start)
+                progress = min(1.0, max(0.0, (entry.offset - wall_start) / wall_duration))
+                media_offset = media_start + progress * max(0.0, media_end - media_start)
+                mapped.append(replace(entry, offset=round(media_offset, 3)))
+                break
+        return mapped
 
     def _collect_once(
         self,

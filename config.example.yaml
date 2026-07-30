@@ -37,15 +37,36 @@ record:
   min_duration_seconds: 10
   ffmpeg_fallback_to_ytdlp: true
   streamlink_fallback_to_ffmpeg: true
-  hls_concurrent_fragments: 8
+  # Keep reconnects in one logical live job; finalize after 4 offline checks over 60 seconds.
+  reconnect_delay_seconds: 5
+  live_end_confirmations: 4
+  live_end_check_interval_seconds: 20
+  hls_concurrent_fragments: 2
   hls_fragment_retries: 5
   capture_realtime_ratio_warning: 0.95
+  proxy:
+    # auto: explicit system proxy, then normal system/TUN routing, then project proxies.
+    enabled: false
+    mode: "auto" # auto | proxy_only | off
+    include_system: true
+    urls:
+      - "http://127.0.0.1:7897"
+    # YAML/JSON/text file containing HTTP proxy endpoint URLs.
+    file: ""
+    # URL returning the same endpoint-list formats; the last valid response is cached.
+    source_url: ""
+    cache_file: "data/proxy/recording-proxies.cache"
+    probe_url: "https://www.showroom-live.com/api/live/onlives"
+    probe_timeout_seconds: 5
+    source_timeout_seconds: 15
+    refresh_seconds: 300
   # Optional test-only limit. Leave empty/null for normal full-live recording.
   max_seconds:
 
 transcode:
   enabled: true
   ffmpeg_bin: "ffmpeg"
+  ffprobe_bin: "ffprobe"
   width: 1920
   height: 1080
   # Empty preserves the source frame cadence.
@@ -57,6 +78,8 @@ transcode:
   audio_codec: "aac"
   audio_bitrate: "192k"
   extra_args: []
+  validate_av_sync: true
+  max_av_desync_seconds: 3
 
 asr:
   enabled: true
@@ -176,5 +199,7 @@ upload:
     upload_subtitle_draft: false
     subtitle_page_wait_seconds: 900
     subtitle_page_poll_seconds: 30
+    subtitle_save_attempts: 3
+    subtitle_save_retry_seconds: 5
     subtitle_errors_fatal: true
     extra_args: []

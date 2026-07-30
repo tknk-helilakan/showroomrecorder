@@ -18,7 +18,7 @@ from .compat import ZoneInfo, to_thread
 from .config import AppConfig, RoomConfig
 from .danmaku import DanmakuCaptureResult, DanmakuRecorder
 from .media import MediaProcessor, assert_tool_available
-from .models import LiveSession, SubtitleSegment
+from .models import LiveSession, RecordingSegment, SubtitleSegment
 from .recorder import StreamRecorder
 from .showroom import LiveStatus, ShowroomClient
 from .subtitles import write_srt, write_transcript_json
@@ -127,24 +127,287 @@ class ShowroomRecorderService:
         LOGGER.info("Live detected: room=%s title=%s job=%s", room.name, session.live_title, job_id)
 
         danmaku_stop, danmaku_task = self._start_danmaku_capture(session)
-        record_failed = False
         try:
-            session.raw_file = await to_thread(self.recorder.record, session)
-            session.ended_at = datetime.now(self.tz)
-            self._append_job_event(session, "recorded", {"raw_file": str(session.raw_file)})
+            segments, recording_errors = await self._record_live_segments(session)
         except Exception as exc:  # noqa: BLE001
-            record_failed = True
-            LOGGER.exception("Recording failed for %s: %s", room.name, exc)
+            session.ended_at = datetime.now(self.tz)
+            LOGGER.exception("Live recording session crashed for %s: %s", room.name, exc)
+            await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
             self._append_job_event(session, "record_failed", {"error": str(exc)})
             self._set_record_retry_cooldown(room)
-        finally:
-            await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
-
-        if record_failed:
             return
+        session.raw_segments = [segment.file for segment in segments]
+        session.metadata["recording_segments"] = [
+            self._recording_segment_payload(segment) for segment in segments
+        ]
+        session.metadata["recording_timeline"] = self._build_recording_timeline(session, segments)
+        session.ended_at = segments[-1].ended_at if segments else datetime.now(self.tz)
+        await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
+
+        if not segments:
+            error = "; ".join(recording_errors[-3:]) or "No usable recording segment was captured"
+            LOGGER.error("Recording session failed for %s: %s", room.name, error)
+            self._append_job_event(session, "record_failed", {"error": error})
+            self._set_record_retry_cooldown(room)
+            return
+
+        raw_dir = self.config.paths.raw_dir / slugify(room.name) / session.job_id
+        merged_file = raw_dir / "recording-merged.mkv"
+        try:
+            session.raw_file = await to_thread(
+                self.media.merge_recording_segments,
+                session.raw_segments,
+                merged_file,
+            )
+            merged_duration = await to_thread(self.recorder.probe_duration, session.raw_file)
+            if merged_duration is None or merged_duration <= 0:
+                raise RuntimeError(f"Could not probe merged recording duration: {session.raw_file}")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Recording segment merge failed for %s: %s", room.name, exc)
+            self._append_job_event(
+                session,
+                "record_failed",
+                {
+                    "error": f"Recording segment merge failed: {exc}",
+                    "raw_segments": [str(path) for path in session.raw_segments],
+                },
+            )
+            return
+
+        self._append_job_event(
+            session,
+            "recording_merged",
+            {
+                "raw_file": str(session.raw_file),
+                "raw_segments": [str(path) for path in session.raw_segments],
+                "segment_count": len(segments),
+                "media_duration_seconds": merged_duration,
+                "recording_timeline": session.metadata["recording_timeline"],
+            },
+        )
+        self._append_job_event(
+            session,
+            "recorded",
+            {
+                "raw_file": str(session.raw_file),
+                "raw_segments": [str(path) for path in session.raw_segments],
+                "segment_count": len(segments),
+            },
+        )
 
         self._append_job_event(session, "processing_queued")
         self._schedule_processing(session)
+
+    async def _record_live_segments(
+        self,
+        session: LiveSession,
+    ) -> tuple[list[RecordingSegment], list[str]]:
+        segments: list[RecordingSegment] = []
+        errors: list[str] = []
+        segment_index = 0
+
+        while not self._stop_event().is_set():
+            segment_index += 1
+            segment_started_at = datetime.now(self.tz)
+            self._append_job_event(
+                session,
+                "recording_segment_started",
+                {
+                    "segment_index": segment_index,
+                    "segment_started_at": segment_started_at.isoformat(),
+                },
+            )
+            try:
+                media_file = await to_thread(
+                    self.recorder.record,
+                    session,
+                    segment_index=segment_index,
+                )
+                segment_ended_at = datetime.now(self.tz)
+                media_duration = await to_thread(self.recorder.probe_duration, media_file)
+                if media_duration is None or media_duration <= 0:
+                    raise RuntimeError(f"Could not determine segment duration: {media_file}")
+                capture_health = await to_thread(
+                    self.recorder.read_capture_health_report,
+                    media_file,
+                )
+                capture_started_at, capture_ended_at = self._capture_window(
+                    segment_started_at,
+                    segment_ended_at,
+                    capture_health,
+                )
+                segment = RecordingSegment(
+                    index=segment_index,
+                    file=media_file,
+                    started_at=capture_started_at,
+                    ended_at=capture_ended_at,
+                    media_duration=media_duration,
+                )
+                segments.append(segment)
+                session.raw_segments.append(media_file)
+                self._append_job_event(
+                    session,
+                    "recording_segment_completed",
+                    self._recording_segment_payload(segment),
+                )
+            except Exception as exc:  # noqa: BLE001
+                segment_ended_at = datetime.now(self.tz)
+                errors.append(str(exc))
+                LOGGER.warning(
+                    "Recording segment %d failed for %s: %s",
+                    segment_index,
+                    session.room.name,
+                    exc,
+                )
+                self._append_job_event(
+                    session,
+                    "recording_segment_failed",
+                    {
+                        "segment_index": segment_index,
+                        "segment_started_at": segment_started_at.isoformat(),
+                        "segment_ended_at": segment_ended_at.isoformat(),
+                        "error": str(exc),
+                    },
+                )
+
+            if self.config.record.max_seconds:
+                LOGGER.info("record.max_seconds is set; finishing the test recording session")
+                break
+            if self._stop_event().is_set():
+                break
+            if not await self._live_session_should_continue(session):
+                break
+
+            self._append_job_event(
+                session,
+                "recording_reconnecting",
+                {
+                    "next_segment_index": segment_index + 1,
+                    "delay_seconds": self.config.record.reconnect_delay_seconds,
+                },
+            )
+            if await self._wait_for_stop(self.config.record.reconnect_delay_seconds):
+                break
+
+        return segments, errors
+
+    async def _live_session_should_continue(self, session: LiveSession) -> bool:
+        required = max(1, int(self.config.record.live_end_confirmations))
+        interval = max(0.0, float(self.config.record.live_end_check_interval_seconds))
+        offline_count = 0
+
+        while not self._stop_event().is_set():
+            try:
+                status = await self._get_live_status(session.room)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Could not confirm live end for %s; keeping the same session: %s",
+                    session.room.name,
+                    exc,
+                )
+                return True
+
+            if status.is_live:
+                LOGGER.info(
+                    "Room %s is still live; recording will reconnect in the same job",
+                    session.room.name,
+                )
+                return True
+            if not status.raw:
+                LOGGER.warning(
+                    "SHOWROOM live status is unknown for %s; keeping the same session",
+                    session.room.name,
+                )
+                return True
+
+            offline_count += 1
+            self._append_job_event(
+                session,
+                "live_end_check",
+                {
+                    "offline_confirmation": offline_count,
+                    "offline_confirmations_required": required,
+                },
+            )
+            if offline_count >= required:
+                self._append_job_event(
+                    session,
+                    "live_ended",
+                    {"offline_confirmations": offline_count},
+                )
+                return False
+            if await self._wait_for_stop(interval):
+                return False
+
+        return False
+
+    async def _wait_for_stop(self, seconds: float) -> bool:
+        delay = max(0.0, float(seconds))
+        if delay <= 0:
+            await asyncio.sleep(0)
+            return self._stop_event().is_set()
+        try:
+            await asyncio.wait_for(self._stop_event().wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    def _recording_segment_payload(self, segment: RecordingSegment) -> dict[str, Any]:
+        return {
+            "segment_index": segment.index,
+            "segment_file": str(segment.file),
+            "segment_started_at": segment.started_at.isoformat(),
+            "segment_ended_at": segment.ended_at.isoformat(),
+            "media_duration_seconds": round(segment.media_duration, 3),
+        }
+
+    def _capture_window(
+        self,
+        fallback_start: datetime,
+        fallback_end: datetime,
+        capture_health: dict,
+    ) -> tuple[datetime, datetime]:
+        try:
+            started_at = datetime.fromtimestamp(
+                float(capture_health["capture_started_at"]),
+                self.tz,
+            )
+            ended_at = datetime.fromtimestamp(
+                float(capture_health["capture_ended_at"]),
+                self.tz,
+            )
+        except (KeyError, TypeError, ValueError, OSError):
+            return fallback_start, fallback_end
+        if ended_at <= started_at:
+            return fallback_start, fallback_end
+        clamped_start = max(fallback_start, started_at)
+        clamped_end = min(fallback_end, ended_at)
+        if clamped_end <= clamped_start:
+            return fallback_start, fallback_end
+        return clamped_start, clamped_end
+
+    def _build_recording_timeline(
+        self,
+        session: LiveSession,
+        segments: list[RecordingSegment],
+    ) -> list[dict[str, float | int]]:
+        media_cursor = 0.0
+        timeline: list[dict[str, float | int]] = []
+        for segment in segments:
+            wall_start = max(0.0, (segment.started_at - session.started_at).total_seconds())
+            wall_end = max(wall_start, (segment.ended_at - session.started_at).total_seconds())
+            media_end = media_cursor + max(0.0, segment.media_duration)
+            timeline.append(
+                {
+                    "segment_index": segment.index,
+                    "wall_start": round(wall_start, 3),
+                    "wall_end": round(wall_end, 3),
+                    "media_start": round(media_cursor, 3),
+                    "media_end": round(media_end, 3),
+                }
+            )
+            media_cursor = media_end
+        return timeline
 
     def _start_danmaku_capture(
         self,
@@ -195,6 +458,7 @@ class ShowroomRecorderService:
                 "danmaku_ass_file": str(result.ass_file) if result.ass_file else None,
                 "danmaku_jsonl_file": str(result.jsonl_file) if result.jsonl_file else None,
                 "danmaku_count": result.count,
+                "danmaku_rendered_count": result.rendered_count,
             },
         )
 
@@ -304,6 +568,7 @@ class ShowroomRecorderService:
             },
         )
         try:
+            self.media.validate_av_sync(session.upload_file)
             bvid = self.uploader.upload(session, segments)
         except Exception as exc:  # noqa: BLE001
             if session.bvid:
@@ -405,6 +670,7 @@ class ShowroomRecorderService:
             "started_at",
             "ended_at",
             "raw_file",
+            "raw_segments",
             "mp4_file",
             "ja_srt_file",
             "zh_srt_file",
@@ -465,6 +731,7 @@ class ShowroomRecorderService:
             live_title=str(snapshot.get("title") or room.name),
             work_dir=self._event_work_dir(snapshot, room=room, job_id=job_id),
             raw_file=self._event_path(snapshot.get("raw_file")),
+            raw_segments=self._event_paths(snapshot.get("raw_segments")),
             mp4_file=self._event_path(snapshot.get("mp4_file")),
             ja_srt_file=self._event_path(snapshot.get("ja_srt_file")),
             zh_srt_file=self._event_path(snapshot.get("zh_srt_file")),
@@ -508,6 +775,11 @@ class ShowroomRecorderService:
         if value in (None, ""):
             return None
         return Path(str(value))
+
+    def _event_paths(self, value: Any) -> list[Path]:
+        if not isinstance(value, list):
+            return []
+        return [Path(str(item)) for item in value if item not in (None, "")]
 
     def _parse_event_datetime(self, value: Any) -> datetime | None:
         if value in (None, ""):
@@ -754,6 +1026,7 @@ class ShowroomRecorderService:
             self._append_job_event(session, "translation_done", {"zh_srt_file": str(session.zh_srt_file)})
 
         session.upload_file = self._prepare_upload_file(session, file_stem)
+        self.media.validate_av_sync(session.upload_file)
         self._append_job_event(session, "upload_file_ready", {"upload_file": str(session.upload_file)})
 
         bvid = self.uploader.upload(session, segments)
@@ -790,7 +1063,7 @@ class ShowroomRecorderService:
             return output_file
 
         output_file = unique_path(upload_dir, upload_stem, ".mp4")
-        shutil.copy2(session.mp4_file, output_file)
+        _link_or_copy(session.mp4_file, output_file)
         if mode == "sidecar" and session.zh_srt_file:
             shutil.copy2(session.zh_srt_file, output_file.with_suffix(".zh.srt"))
         self._copy_danmaku_sidecars(session, output_file)
@@ -866,6 +1139,7 @@ class ShowroomRecorderService:
         ):
             if path:
                 candidates.append(path)
+        candidates.extend(session.raw_segments)
         if session.raw_file:
             candidates.append(session.raw_file.parent)
         if session.mp4_file:
@@ -930,8 +1204,8 @@ class ShowroomRecorderService:
                 raise RuntimeError(
                     "yt-dlp is required. Install dependencies with: pip install -r requirements.txt"
                 )
-        if self.config.transcode.enabled or self.config.record.strategy == "ffmpeg":
-            assert_tool_available(self.config.transcode.ffmpeg_bin)
+        assert_tool_available(self.config.transcode.ffmpeg_bin)
+        assert_tool_available(self.media.ffprobe_bin())
         if self.config.asr.enabled and self.config.asr.provider in {"openai", "openai_compatible"}:
             assert_tool_available(self.config.transcode.ffmpeg_bin)
             if not os.getenv(self.config.asr.api_key_env, ""):
@@ -983,6 +1257,7 @@ class ShowroomRecorderService:
             "started_at": session.started_at.isoformat(),
             "ended_at": session.ended_at.isoformat() if session.ended_at else None,
             "raw_file": str(session.raw_file) if session.raw_file else None,
+            "raw_segments": [str(path) for path in session.raw_segments],
             "mp4_file": str(session.mp4_file) if session.mp4_file else None,
             "ja_srt_file": str(session.ja_srt_file) if session.ja_srt_file else None,
             "zh_srt_file": str(session.zh_srt_file) if session.zh_srt_file else None,
@@ -996,3 +1271,11 @@ class ShowroomRecorderService:
         self.config.paths.jobs_log.parent.mkdir(parents=True, exist_ok=True)
         with self.config.paths.jobs_log.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        LOGGER.debug("Hard-link staging failed; copying %s to %s: %s", source, destination, exc)
+        shutil.copy2(source, destination)
