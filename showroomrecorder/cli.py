@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+from .baidu_netdisk import BaiduNetdiskClient
 from .config import load_config
 from .logging_setup import setup_logging
 from .runner import ShowroomRecorderService
@@ -52,6 +53,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Live title override for --process-raw. Defaults to the configured room name.",
     )
     parser.add_argument(
+        "--baidu-auth",
+        action="store_true",
+        help="Authorize Baidu Netdisk with the device-code flow and save the token locally.",
+    )
+    parser.add_argument(
+        "--baidu-list-dirs",
+        nargs="?",
+        const="/",
+        metavar="REMOTE_PATH",
+        help="List Baidu Netdisk directories recursively. Defaults to the account root.",
+    )
+    parser.add_argument(
+        "--baidu-list-depth",
+        type=int,
+        default=3,
+        help="Maximum recursion depth for --baidu-list-dirs. Defaults to 3.",
+    )
+    parser.add_argument(
         "--yt-dlp-worker",
         nargs=argparse.REMAINDER,
         help=argparse.SUPPRESS,
@@ -75,6 +94,22 @@ def main() -> None:
 
     config = load_config(Path(args.config))
     setup_logging(config.service.log_level, config.paths.logs_dir)
+    if args.baidu_auth or args.baidu_list_dirs is not None:
+        client = BaiduNetdiskClient(config)
+        if args.baidu_auth:
+            client.authorize_device()
+        if args.baidu_list_dirs is not None:
+            root = args.baidu_list_dirs or "/"
+            print(f"Baidu Netdisk directories under {root}:")
+            directories = client.list_directory_tree(
+                root,
+                max_depth=max(0, args.baidu_list_depth),
+            )
+            if not directories:
+                print("(no directories found)")
+            for item in directories:
+                print(str(item.get("path") or item.get("server_filename") or ""))
+        return
     service = ShowroomRecorderService(config)
     if args.process_raw:
         service.process_existing_recording(

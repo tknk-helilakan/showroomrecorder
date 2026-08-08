@@ -19,7 +19,7 @@
 - 支持把中文字幕硬压进 MP4 后上传，或只上传无硬字幕 MP4 并保留字幕文件。
 - 上传通过 `biliup` 命令行完成，并可选尝试调用 Bilibili 字幕草稿接口上传字幕。
 - 支持按月合集投稿：本月第一次自动新投稿，后续直播自动追加分 P。
-- 可配置上传成功后只保留最终上传用 MP4 和字幕文件，清理中间产物。
+- 可把转码前的 `recording-merged.mkv` 自动备份到百度网盘；百度、B 站视频和所需字幕全部成功后清理该任务产物，只保留日志。
 
 请只录制和上传你有权处理的直播内容，并遵守 SHOWROOM 与 Bilibili 的平台规则。
 
@@ -124,10 +124,11 @@ record:
   reconnect_delay_seconds: 5
   live_end_confirmations: 4
   live_end_check_interval_seconds: 20
+  live_end_grace_seconds: 180
   hls_concurrent_fragments: 2
 ```
 
-默认在录制进程退出后等待 5 秒重连。房间首次显示下线后，每 20 秒复查一次，连续 4 次确认下线（总计约 60 秒）才结束同一逻辑任务，因此短暂断流或主播快速重连不会产生多个独立上传。各段保存在 `raw/<主播>/<job_id>/segments/`，随后逐段重建从零开始的音视频 PTS，再通过 FFmpeg concat filter 合并为连续时间轴。`hls_concurrent_fragments` 默认使用 2，避免对 SHOWROOM CDN 发起过多并行分片请求。
+默认在录制进程退出后等待 5 秒重连。房间首次显示下线后，每 20 秒复查一次，连续 4 次确认下线后先生成 `recording-merged.mkv`，再持续观察 180 秒。观察期内复播会继续写入同一个 `job_id`、重新合并并重新开始观察；连续 3 分钟没有复播才进入上传处理。各段保存在 `raw/<主播>/<job_id>/segments/`，随后逐段重建从零开始的音视频 PTS，再通过 FFmpeg concat filter 合并为连续时间轴。`hls_concurrent_fragments` 默认使用 2，避免对 SHOWROOM CDN 发起过多并行分片请求。
 
 弹幕 JSONL 保留原始墙钟时间；生成 ASS 时会按每段录制的实际媒体时长映射到合并后的视频时间轴。断流期间没有对应画面的评论不会烧录到后续片段上。
 
@@ -327,7 +328,7 @@ upload:
   uploader: biliup
   subtitle_mode: sidecar
   cleanup_after_success: true
-  keep_latest_upload_per_room: true
+  keep_latest_upload_per_room: false
   biliup:
     mode: monthly
     bin: biliup
@@ -380,6 +381,36 @@ upload:
 ```
 
 这一步依赖 Bilibili 未公开接口，可能因为账号、审核、接口变化而失败。默认 `subtitle_errors_fatal: true`，字幕上传失败会让本次任务标记为失败并保留中间文件，方便重新生成或重传；如果只想视频投稿成功即可，可以改成 `false`。
+
+### 上传合并录播到百度网盘
+
+百度网盘只上传转码、弹幕烧录和字幕处理前的 `recording-merged.mkv`，不会上传零散录制分段或最终 B 站 MP4。先在本地 `config.yaml` 填写应用的 AppKey 和 SecretKey，暂时保持 `enabled: false`、`remote_root: ""`：
+
+```yaml
+baidu_netdisk:
+  enabled: false
+  required_for_cleanup: true
+  app_key: "你的 AppKey"
+  secret_key: "你的 SecretKey"
+  token_file: "data/baidu-netdisk-token.json"
+  state_dir: "data/baidu-netdisk/uploads"
+  remote_root: ""
+  remote_path_template: "{streamer_slug}/{streamer_slug}_{started_at:%Y%m%d_%H%M%S}_recording-merged.mkv"
+  conflict_policy: "overwrite"
+  chunk_size_mb: 4
+  retries: 5
+```
+
+在控制台完成设备码授权，然后递归列出账号目录：
+
+```powershell
+python -m showroomrecorder --config config.yaml --baidu-auth
+python -m showroomrecorder --config config.yaml --baidu-list-dirs / --baidu-list-depth 4
+```
+
+选定目录后，把其完整绝对路径写入 `remote_root`，再设置 `enabled: true`。令牌会保存在 `token_file`，访问令牌过期前会用 refresh token 自动刷新。上传使用 4 MiB 分片，并在 `state_dir` 保存断点；进程重启后会跳过已经上传的分片和已经完成的文件。
+
+当 `upload.cleanup_after_success: true` 且 `required_for_cleanup: true` 时，只有百度 MKV、B 站视频以及配置要求的 B 站字幕均成功，程序才删除本次任务的原始分段、合并文件、转码文件、字幕、弹幕、上传暂存和断点状态。FFmpeg、录制和 biliup 日志会归档到 `data/logs/jobs/<主播>/<job_id>/`，`jobs.jsonl` 始终保留。
 
 ## 本地打包
 

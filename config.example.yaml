@@ -41,6 +41,8 @@ record:
   reconnect_delay_seconds: 5
   live_end_confirmations: 4
   live_end_check_interval_seconds: 20
+  # After merging, keep watching this room for 3 minutes. A reopen continues the same job.
+  live_end_grace_seconds: 180
   hls_concurrent_fragments: 2
   hls_fragment_retries: 5
   capture_realtime_ratio_warning: 0.95
@@ -213,3 +215,23 @@ upload:
     subtitle_save_retry_seconds: 5
     subtitle_errors_fatal: true
     extra_args: []
+
+baidu_netdisk:
+  # Configure credentials, run --baidu-auth, choose remote_root with
+  # --baidu-list-dirs, then set enabled to true.
+  enabled: false
+  # When true, cleanup is blocked while Baidu upload is disabled or incomplete.
+  required_for_cleanup: false
+  app_key: ""
+  secret_key: ""
+  token_file: "data/baidu-netdisk-token.json"
+  state_dir: "data/baidu-netdisk/uploads"
+  remote_root: ""
+  remote_path_template: "{streamer_slug}/{streamer_slug}_{started_at:%Y%m%d_%H%M%S}_recording-merged.mkv"
+  conflict_policy: "overwrite" # fail | rename | overwrite
+  chunk_size_mb: 4
+  retries: 5
+  retry_seconds: 2
+  request_timeout_seconds: 60
+  upload_timeout_seconds: 300
+  trust_env: false

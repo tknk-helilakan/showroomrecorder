@@ -148,41 +148,100 @@ class BiliupUploader:
             session.bvid = bvid
             self._add_to_collection(session, bvid, user_cookie)
 
-        if (
-            bvid
-            and segments
-            and bool(biliup_cfg.get("upload_subtitle_draft", False))
-            and session.zh_srt_file
-        ):
-            session.metadata.pop("subtitle_uploaded", None)
-            session.metadata.pop("subtitle_upload_error", None)
-            session.metadata["subtitle_upload_attempted"] = True
-            try:
-                SubtitleDraftUploader(
-                    cookie_file=self._resolve_config_path(user_cookie),
-                    language=str(biliup_cfg.get("subtitle_language", "zh")),
-                    trust_env=bool(biliup_cfg.get("trust_env", False)),
-                    page_wait_seconds=int(biliup_cfg.get("subtitle_page_wait_seconds") or 900),
-                    page_poll_seconds=int(biliup_cfg.get("subtitle_page_poll_seconds") or 30),
-                    save_attempts=int(biliup_cfg.get("subtitle_save_attempts") or 3),
-                    save_retry_seconds=int(biliup_cfg.get("subtitle_save_retry_seconds") or 5),
-                ).upload(
-                    bvid,
-                    segments,
-                    part_titles=subtitle_part_titles,
-                    prefer_last=prefer_last_part,
-                    allow_unmatched_fallback=_bool_value(
-                        biliup_cfg.get("subtitle_allow_unmatched_fallback", False),
-                        default=False,
-                    ),
-                )
-                session.metadata["subtitle_uploaded"] = True
-            except Exception as exc:  # noqa: BLE001
-                session.metadata["subtitle_upload_error"] = str(exc)
-                LOGGER.warning("Bilibili subtitle draft upload failed: %s", exc)
-                if _bool_value(biliup_cfg.get("subtitle_errors_fatal", False), default=False):
-                    raise
+        if bvid:
+            self._upload_subtitle_draft(
+                session,
+                bvid,
+                segments or [],
+                user_cookie=user_cookie,
+                part_titles=subtitle_part_titles,
+                prefer_last=prefer_last_part,
+            )
         return bvid
+
+    def complete_post_upload(
+        self,
+        session: LiveSession,
+        bvid: str,
+        segments: list[SubtitleSegment] | None = None,
+    ) -> str:
+        if not self.config.upload.enabled:
+            raise RuntimeError("Cannot complete Bilibili upload while upload.enabled is false")
+        if not bvid:
+            raise ValueError("A BVID is required to resume Bilibili post-upload work")
+        session.bvid = bvid
+        biliup_cfg = self.config.upload.biliup
+        user_cookie = biliup_cfg.get("user_cookie")
+        self._add_to_collection(session, bvid, user_cookie)
+
+        mode = str(biliup_cfg.get("mode", "upload")).lower()
+        part_titles: list[str] = []
+        prefer_last = mode in {"append", "monthly", "auto_monthly", "monthly_append"}
+        if prefer_last:
+            part_title = render_template(
+                self.config.naming.part_title_template,
+                self._context(session),
+            )
+            part_titles = self._subtitle_part_title_candidates(
+                session,
+                part_title,
+                use_upload_file_title_only=self._use_small_chunk_upload(),
+            )
+        self._upload_subtitle_draft(
+            session,
+            bvid,
+            segments or [],
+            user_cookie=user_cookie,
+            part_titles=part_titles,
+            prefer_last=prefer_last,
+        )
+        return bvid
+
+    def _upload_subtitle_draft(
+        self,
+        session: LiveSession,
+        bvid: str,
+        segments: list[SubtitleSegment],
+        *,
+        user_cookie: Any,
+        part_titles: list[str],
+        prefer_last: bool,
+    ) -> None:
+        biliup_cfg = self.config.upload.biliup
+        if (
+            not segments
+            or not _bool_value(biliup_cfg.get("upload_subtitle_draft", False), default=False)
+            or not session.zh_srt_file
+            or session.metadata.get("subtitle_uploaded")
+        ):
+            return
+        session.metadata.pop("subtitle_upload_error", None)
+        session.metadata["subtitle_upload_attempted"] = True
+        try:
+            SubtitleDraftUploader(
+                cookie_file=self._resolve_config_path(user_cookie),
+                language=str(biliup_cfg.get("subtitle_language", "zh")),
+                trust_env=bool(biliup_cfg.get("trust_env", False)),
+                page_wait_seconds=int(biliup_cfg.get("subtitle_page_wait_seconds") or 900),
+                page_poll_seconds=int(biliup_cfg.get("subtitle_page_poll_seconds") or 30),
+                save_attempts=int(biliup_cfg.get("subtitle_save_attempts") or 3),
+                save_retry_seconds=int(biliup_cfg.get("subtitle_save_retry_seconds") or 5),
+            ).upload(
+                bvid,
+                segments,
+                part_titles=part_titles,
+                prefer_last=prefer_last,
+                allow_unmatched_fallback=_bool_value(
+                    biliup_cfg.get("subtitle_allow_unmatched_fallback", False),
+                    default=False,
+                ),
+            )
+            session.metadata["subtitle_uploaded"] = True
+        except Exception as exc:  # noqa: BLE001
+            session.metadata["subtitle_upload_error"] = str(exc)
+            LOGGER.warning("Bilibili subtitle draft upload failed: %s", exc)
+            if _bool_value(biliup_cfg.get("subtitle_errors_fatal", False), default=False):
+                raise
 
     def _add_to_collection(self, session: LiveSession, bvid: str, user_cookie: Any) -> None:
         collection_cfg = self.config.upload.biliup.get("collection")

@@ -39,6 +39,7 @@ record:
   reconnect_delay_seconds: 5
   live_end_confirmations: 4
   live_end_check_interval_seconds: 20
+  live_end_grace_seconds: 180
   hls_concurrent_fragments: 2
   proxy:
     enabled: false
@@ -186,3 +187,20 @@ upload:
     subtitle_save_retry_seconds: 5
     subtitle_errors_fatal: true
     extra_args: []
+
+baidu_netdisk:
+  enabled: false
+  required_for_cleanup: false
+  app_key: ""
+  secret_key: ""
+  token_file: "data/baidu-netdisk-token.json"
+  state_dir: "data/baidu-netdisk/uploads"
+  remote_root: ""
+  remote_path_template: "{streamer_slug}/{streamer_slug}_{started_at:%Y%m%d_%H%M%S}_recording-merged.mkv"
+  conflict_policy: "overwrite"
+  chunk_size_mb: 4
+  retries: 5
+  retry_seconds: 2
+  request_timeout_seconds: 60
+  upload_timeout_seconds: 300
+  trust_env: false

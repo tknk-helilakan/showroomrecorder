@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
+from .baidu_netdisk import BaiduNetdiskClient, BaiduUploadResult
 from .compat import ZoneInfo, to_thread
 from .config import AppConfig, RoomConfig
 from .danmaku import DanmakuCaptureResult, DanmakuRecorder
@@ -41,6 +42,7 @@ class ShowroomRecorderService:
         self.transcriber = create_transcriber(config.asr, config.transcode.ffmpeg_bin)
         self.translator = Translator(config.translation)
         self.uploader = BiliupUploader(config)
+        self.baidu_netdisk = BaiduNetdiskClient(config)
         self.processing_sem: asyncio.Semaphore | None = None
         self.status_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, config.service.status_parallelism),
@@ -127,62 +129,100 @@ class ShowroomRecorderService:
         LOGGER.info("Live detected: room=%s title=%s job=%s", room.name, session.live_title, job_id)
 
         danmaku_stop, danmaku_task = self._start_danmaku_capture(session)
+        segments: list[RecordingSegment] = []
+        recording_errors: list[str] = []
+        merged_duration = 0.0
         try:
-            segments, recording_errors = await self._record_live_segments(session)
-        except Exception as exc:  # noqa: BLE001
-            session.ended_at = datetime.now(self.tz)
-            LOGGER.exception("Live recording session crashed for %s: %s", room.name, exc)
-            await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
-            self._append_job_event(session, "record_failed", {"error": str(exc)})
-            self._set_record_retry_cooldown(room)
-            return
-        session.raw_segments = [segment.file for segment in segments]
-        session.metadata["recording_segments"] = [
-            self._recording_segment_payload(segment) for segment in segments
-        ]
-        session.metadata["recording_timeline"] = self._build_recording_timeline(session, segments)
-        session.ended_at = segments[-1].ended_at if segments else datetime.now(self.tz)
-        await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
+            while not self._stop_event().is_set():
+                new_segments, new_errors = await self._record_live_segments(
+                    session,
+                    start_index=len(segments),
+                )
+                segments.extend(new_segments)
+                recording_errors.extend(new_errors)
+                self._update_recording_session(session, segments)
 
-        if not segments:
-            error = "; ".join(recording_errors[-3:]) or "No usable recording segment was captured"
-            LOGGER.error("Recording session failed for %s: %s", room.name, error)
-            self._append_job_event(session, "record_failed", {"error": error})
-            self._set_record_retry_cooldown(room)
-            return
+                if not segments:
+                    error = "; ".join(recording_errors[-3:]) or "No usable recording segment was captured"
+                    LOGGER.error("Recording session failed for %s: %s", room.name, error)
+                    self._append_job_event(session, "record_failed", {"error": error})
+                    self._set_record_retry_cooldown(room)
+                    return
 
-        raw_dir = self.config.paths.raw_dir / slugify(room.name) / session.job_id
-        merged_file = raw_dir / "recording-merged.mkv"
-        try:
-            session.raw_file = await to_thread(
-                self.media.merge_recording_segments,
-                session.raw_segments,
-                merged_file,
-            )
-            merged_duration = await to_thread(self.recorder.probe_duration, session.raw_file)
-            if merged_duration is None or merged_duration <= 0:
-                raise RuntimeError(f"Could not probe merged recording duration: {session.raw_file}")
+                raw_dir = self.config.paths.raw_dir / slugify(room.name) / session.job_id
+                merged_file = raw_dir / "recording-merged.mkv"
+                session.raw_file = await to_thread(
+                    self.media.merge_recording_segments,
+                    session.raw_segments,
+                    merged_file,
+                )
+                merged_duration_value = await to_thread(
+                    self.recorder.probe_duration,
+                    session.raw_file,
+                )
+                if merged_duration_value is None or merged_duration_value <= 0:
+                    raise RuntimeError(
+                        f"Could not probe merged recording duration: {session.raw_file}"
+                    )
+                merged_duration = merged_duration_value
+                self._append_job_event(
+                    session,
+                    "recording_merged",
+                    {
+                        "raw_file": str(session.raw_file),
+                        "raw_segments": [str(path) for path in session.raw_segments],
+                        "segment_count": len(segments),
+                        "media_duration_seconds": merged_duration,
+                        "recording_timeline": session.metadata["recording_timeline"],
+                    },
+                )
+
+                if self.config.record.max_seconds:
+                    break
+                reopened = await self._wait_for_live_reopen(session)
+                if reopened is None:
+                    self._append_job_event(session, "live_finalization_interrupted")
+                    return
+                if not reopened:
+                    break
+                self._append_job_event(
+                    session,
+                    "live_reopened",
+                    {"next_segment_index": len(segments) + 1},
+                )
+                LOGGER.info(
+                    "Room %s reopened during the grace period; continuing job=%s",
+                    room.name,
+                    session.job_id,
+                )
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Recording segment merge failed for %s: %s", room.name, exc)
+            session.ended_at = session.ended_at or datetime.now(self.tz)
+            LOGGER.exception("Live recording session failed for %s: %s", room.name, exc)
             self._append_job_event(
                 session,
                 "record_failed",
                 {
-                    "error": f"Recording segment merge failed: {exc}",
+                    "error": str(exc),
                     "raw_segments": [str(path) for path in session.raw_segments],
                 },
             )
+            self._set_record_retry_cooldown(room)
+            return
+        finally:
+            await self._finish_danmaku_capture(session, danmaku_stop, danmaku_task)
+
+        if self._stop_event().is_set() and not self.config.record.max_seconds:
+            self._append_job_event(session, "live_finalization_interrupted")
             return
 
         self._append_job_event(
             session,
-            "recording_merged",
+            "live_finalized",
             {
-                "raw_file": str(session.raw_file),
-                "raw_segments": [str(path) for path in session.raw_segments],
+                "grace_seconds": int(
+                    getattr(self.config.record, "live_end_grace_seconds", 180)
+                ),
                 "segment_count": len(segments),
-                "media_duration_seconds": merged_duration,
-                "recording_timeline": session.metadata["recording_timeline"],
             },
         )
         self._append_job_event(
@@ -201,10 +241,12 @@ class ShowroomRecorderService:
     async def _record_live_segments(
         self,
         session: LiveSession,
+        *,
+        start_index: int = 0,
     ) -> tuple[list[RecordingSegment], list[str]]:
         segments: list[RecordingSegment] = []
         errors: list[str] = []
-        segment_index = 0
+        segment_index = max(0, int(start_index))
 
         while not self._stop_event().is_set():
             segment_index += 1
@@ -290,6 +332,73 @@ class ShowroomRecorderService:
                 break
 
         return segments, errors
+
+    def _update_recording_session(
+        self,
+        session: LiveSession,
+        segments: list[RecordingSegment],
+    ) -> None:
+        session.raw_segments = [segment.file for segment in segments]
+        session.metadata["recording_segments"] = [
+            self._recording_segment_payload(segment) for segment in segments
+        ]
+        session.metadata["recording_timeline"] = self._build_recording_timeline(session, segments)
+        session.ended_at = segments[-1].ended_at if segments else datetime.now(self.tz)
+
+    async def _wait_for_live_reopen(self, session: LiveSession) -> bool | None:
+        grace_seconds = max(
+            0.0,
+            float(getattr(self.config.record, "live_end_grace_seconds", 180)),
+        )
+        if grace_seconds <= 0:
+            return False
+        interval = max(1.0, float(self.config.record.live_end_check_interval_seconds))
+        deadline = time.monotonic() + grace_seconds
+        self._append_job_event(
+            session,
+            "live_end_grace_started",
+            {"grace_seconds": grace_seconds},
+        )
+        LOGGER.info(
+            "Waiting %.0f second(s) to confirm %s does not reopen",
+            grace_seconds,
+            session.room.name,
+        )
+        while not self._stop_event().is_set():
+            remaining = deadline - time.monotonic()
+            delay = min(interval, remaining) if remaining > 0 else interval
+            if delay > 0 and await self._wait_for_stop(delay):
+                return None
+            try:
+                status = await self._get_live_status(session.room)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Could not check grace-period status for %s: %s",
+                    session.room.name,
+                    exc,
+                )
+                self._append_job_event(
+                    session,
+                    "live_end_grace_check_failed",
+                    {"error": str(exc)},
+                )
+                continue
+            if status.is_live:
+                return True
+            if not status.raw:
+                LOGGER.warning(
+                    "SHOWROOM status is unknown for %s during the grace period",
+                    session.room.name,
+                )
+                continue
+            if time.monotonic() >= deadline:
+                return False
+            self._append_job_event(
+                session,
+                "live_end_grace_check",
+                {"remaining_seconds": round(max(0.0, deadline - time.monotonic()), 1)},
+            )
+        return None
 
     async def _live_session_should_continue(self, session: LiveSession) -> bool:
         required = max(1, int(self.config.record.live_end_confirmations))
@@ -567,9 +676,13 @@ class ShowroomRecorderService:
                 "translated_segments": len(segments),
             },
         )
+        baidu_result = self._upload_baidu_recording(session)
         try:
-            self.media.validate_av_sync(session.upload_file)
-            bvid = self.uploader.upload(session, segments)
+            if session.bvid:
+                bvid = self.uploader.complete_post_upload(session, session.bvid, segments)
+            else:
+                self.media.validate_av_sync(session.upload_file)
+                bvid = self.uploader.upload(session, segments)
         except Exception as exc:  # noqa: BLE001
             if session.bvid:
                 self._append_job_event(
@@ -606,6 +719,44 @@ class ShowroomRecorderService:
                 },
             )
 
+        requirements = self._upload_completion_requirements(
+            session,
+            segments=segments,
+            bvid=bvid,
+            baidu_result=baidu_result,
+        )
+        if self.config.upload.cleanup_after_success and bvid:
+            if all(requirements.values()):
+                file_stem = self._recovery_file_stem(session)
+                archived_logs = self._archive_job_logs(session)
+                removed_paths = self._cleanup_after_success(session, file_stem)
+                self._append_job_event(
+                    session,
+                    "cleanup_done",
+                    {
+                        "removed_paths": removed_paths,
+                        "archived_logs": archived_logs,
+                        "requirements": requirements,
+                        "recovered": True,
+                    },
+                )
+                self._append_job_event(
+                    session,
+                    "job_completed",
+                    {"requirements": requirements, "recovered": True},
+                )
+            else:
+                pending = [name for name, complete in requirements.items() if not complete]
+                self._append_job_event(
+                    session,
+                    "cleanup_deferred",
+                    {
+                        "pending": pending,
+                        "requirements": requirements,
+                        "recovered": True,
+                    },
+                )
+
     def _append_collection_result_event(
         self,
         session: LiveSession,
@@ -639,9 +790,6 @@ class ShowroomRecorderService:
         sessions: list[LiveSession] = []
         for job_id, items in grouped.items():
             if self._job_has_upload_terminal_event(items):
-                continue
-            if any(item.get("bvid") for item in items):
-                LOGGER.info("Skipping upload recovery for %s because a BVID is already recorded", job_id)
                 continue
             if not any(item.get("event") == "upload_file_ready" and item.get("upload_file") for item in items):
                 continue
@@ -681,8 +829,16 @@ class ShowroomRecorderService:
         return events
 
     def _job_has_upload_terminal_event(self, items: list[dict[str, Any]]) -> bool:
-        terminal_events = {"uploaded", "upload_skipped", "cleanup_done"}
-        return any(str(item.get("event") or "") in terminal_events for item in items)
+        terminal_events = {"job_completed", "cleanup_done", "upload_skipped"}
+        if not self.config.upload.cleanup_after_success:
+            terminal_events.add("uploaded")
+        if any(str(item.get("event") or "") in terminal_events for item in items):
+            return True
+        events = {str(item.get("event") or "") for item in items}
+        if "uploaded" in events and not any(event.startswith("baidu_upload_") for event in events):
+            # Jobs completed before Baidu backup support should not be reclassified retroactively.
+            return True
+        return False
 
     def _job_snapshot(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         snapshot = dict(items[-1])
@@ -708,6 +864,12 @@ class ShowroomRecorderService:
                 if value not in (None, ""):
                     snapshot[field] = value
                     break
+        snapshot["subtitle_uploaded"] = any(
+            item.get("event") == "subtitle_uploaded" for item in items
+        )
+        snapshot["baidu_uploaded"] = any(
+            item.get("event") == "baidu_uploaded" for item in items
+        )
         return snapshot
 
     def _job_looks_in_progress(self, items: list[dict[str, Any]], snapshot: dict[str, Any]) -> bool:
@@ -761,7 +923,12 @@ class ShowroomRecorderService:
             danmaku_ass_file=self._event_path(snapshot.get("danmaku_ass_file")),
             danmaku_jsonl_file=self._event_path(snapshot.get("danmaku_jsonl_file")),
             upload_file=self._event_path(snapshot.get("upload_file")),
-            metadata={"upload_recovery": True},
+            bvid=str(snapshot.get("bvid") or "") or None,
+            metadata={
+                "upload_recovery": True,
+                "subtitle_uploaded": bool(snapshot.get("subtitle_uploaded")),
+                "baidu_uploaded": bool(snapshot.get("baidu_uploaded")),
+            },
         )
         return session
 
@@ -978,6 +1145,8 @@ class ShowroomRecorderService:
         if not session.raw_file:
             raise RuntimeError("Missing raw recording")
 
+        baidu_result = self._upload_baidu_recording(session)
+
         context = build_context(
             streamer=session.room.name,
             room_url=session.room.url,
@@ -1068,9 +1237,98 @@ class ShowroomRecorderService:
                         "error": str(session.metadata["subtitle_upload_error"]),
                     },
                 )
+        requirements = self._upload_completion_requirements(
+            session,
+            segments=segments,
+            bvid=bvid,
+            baidu_result=baidu_result,
+        )
+        session.metadata["upload_completion_requirements"] = requirements
         if self.config.upload.enabled and bvid and self.config.upload.cleanup_after_success:
-            removed_paths = self._cleanup_after_success(session, file_stem)
-            self._append_job_event(session, "cleanup_done", {"removed_paths": removed_paths})
+            if all(requirements.values()):
+                archived_logs = self._archive_job_logs(session)
+                removed_paths = self._cleanup_after_success(session, file_stem)
+                self._append_job_event(
+                    session,
+                    "cleanup_done",
+                    {
+                        "removed_paths": removed_paths,
+                        "archived_logs": archived_logs,
+                        "requirements": requirements,
+                    },
+                )
+                self._append_job_event(session, "job_completed", {"requirements": requirements})
+            else:
+                pending = [name for name, complete in requirements.items() if not complete]
+                LOGGER.warning(
+                    "Keeping all files for %s because required uploads are incomplete: %s",
+                    session.job_id,
+                    ", ".join(pending),
+                )
+                self._append_job_event(
+                    session,
+                    "cleanup_deferred",
+                    {"pending": pending, "requirements": requirements},
+                )
+
+    def _upload_baidu_recording(self, session: LiveSession) -> BaiduUploadResult | None:
+        if not self.config.baidu_netdisk.enabled:
+            self._append_job_event(session, "baidu_upload_skipped", {"reason": "disabled"})
+            return None
+        self._append_job_event(
+            session,
+            "baidu_upload_started",
+            {"local_file": str(session.raw_file) if session.raw_file else None},
+        )
+        try:
+            result = self.baidu_netdisk.upload_recording(session)
+        except Exception as exc:  # noqa: BLE001
+            session.metadata["baidu_upload_error"] = str(exc)
+            LOGGER.exception("Baidu Netdisk upload failed for %s: %s", session.job_id, exc)
+            self._append_job_event(session, "baidu_upload_failed", {"error": str(exc)})
+            return None
+        if result is None:
+            return None
+        session.metadata["baidu_uploaded"] = True
+        session.metadata["baidu_remote_path"] = result.path
+        self._append_job_event(
+            session,
+            "baidu_uploaded",
+            {
+                "remote_path": result.path,
+                "remote_fs_id": result.fs_id,
+                "size": result.size,
+                "md5": result.md5,
+                "rapid_upload": result.rapid_upload,
+                "resumed": result.resumed,
+            },
+        )
+        return result
+
+    def _upload_completion_requirements(
+        self,
+        session: LiveSession,
+        *,
+        segments: list[SubtitleSegment],
+        bvid: str | None,
+        baidu_result: BaiduUploadResult | None,
+    ) -> dict[str, bool]:
+        subtitle_required = bool(
+            self.config.asr.enabled
+            and session.zh_srt_file
+            and self.config.upload.biliup.get("upload_subtitle_draft", False)
+        )
+        return {
+            "baidu_recording": (
+                baidu_result is not None
+                if self.config.baidu_netdisk.enabled
+                else not self.config.baidu_netdisk.required_for_cleanup
+            ),
+            "bilibili_video": (not self.config.upload.enabled or bool(bvid)),
+            "bilibili_subtitle": (
+                not subtitle_required or bool(session.metadata.get("subtitle_uploaded"))
+            ),
+        }
 
     def _prepare_upload_file(self, session: LiveSession, file_stem: str) -> Path:
         if not session.mp4_file:
@@ -1142,16 +1400,6 @@ class ShowroomRecorderService:
         keep: set[Path] = set()
         removed: list[str] = []
 
-        def remember_keep(path: Path | None) -> None:
-            if path and path.exists():
-                keep.add(path.resolve())
-
-        remember_keep(session.upload_file)
-        if session.upload_file:
-            remember_keep(session.upload_file.with_suffix(".zh.srt"))
-            remember_keep(session.upload_file.with_suffix(".danmaku.ass"))
-            remember_keep(session.upload_file.with_suffix(".danmaku.jsonl"))
-
         candidates: list[Path] = []
         for path in (
             session.raw_file,
@@ -1160,38 +1408,124 @@ class ShowroomRecorderService:
             session.zh_srt_file,
             session.danmaku_ass_file,
             session.danmaku_jsonl_file,
+            session.upload_file,
         ):
             if path:
                 candidates.append(path)
+        if session.upload_file:
+            candidates.extend(
+                [
+                    session.upload_file.with_suffix(".zh.srt"),
+                    session.upload_file.with_suffix(".danmaku.ass"),
+                    session.upload_file.with_suffix(".danmaku.jsonl"),
+                    session.upload_file.with_suffix(".hardsub.log"),
+                ]
+            )
         candidates.extend(session.raw_segments)
         if session.raw_file:
             candidates.append(session.raw_file.parent)
         if session.mp4_file:
             candidates.append(session.mp4_file.with_suffix(".ffmpeg.log"))
             candidates.extend(session.mp4_file.parent.glob(f"{session.mp4_file.stem}.asr*"))
+            candidates.append(
+                session.mp4_file.parent / f"{session.mp4_file.stem}.openai_audio_chunks"
+            )
         subtitle_dir = self.config.paths.subtitles_dir / slugify(session.room.name)
         candidates.extend(subtitle_dir.glob(f"{file_stem}*"))
         if session.danmaku_ass_file:
             candidates.append(session.danmaku_ass_file.parent)
         candidates.append(session.work_dir)
+        candidates.append(self.baidu_netdisk.state_file_for(session))
 
         for path in candidates:
             removed.extend(self._remove_cleanup_path(path, keep))
 
-        if self.config.upload.keep_latest_upload_per_room and session.upload_file:
-            upload_dir = session.upload_file.parent
-            latest_mtime = session.upload_file.stat().st_mtime if session.upload_file.exists() else None
-            for path in upload_dir.iterdir():
-                if latest_mtime is not None:
-                    try:
-                        if path.stat().st_mtime > latest_mtime:
-                            continue
-                    except OSError:
-                        continue
-                removed.extend(self._remove_cleanup_path(path, keep))
-
         LOGGER.info("Cleanup after successful upload removed %d path(s)", len(removed))
         return removed
+
+    def _archive_job_logs(self, session: LiveSession) -> list[str]:
+        archive_dir = (
+            self.config.paths.logs_dir
+            / "jobs"
+            / slugify(session.room.name)
+            / session.job_id
+        )
+        sources: list[tuple[str, Path, Path]] = []
+        if session.raw_file and session.raw_file.parent.exists():
+            sources.append(("raw", session.raw_file.parent, session.raw_file.parent))
+        if session.work_dir.exists():
+            sources.append(("work", session.work_dir, session.work_dir))
+        if session.mp4_file:
+            chunks_dir = (
+                session.mp4_file.parent / f"{session.mp4_file.stem}.openai_audio_chunks"
+            )
+            if chunks_dir.exists():
+                sources.append(("asr", chunks_dir, chunks_dir))
+
+        copied: list[str] = []
+        seen: set[Path] = set()
+        for label, root, search_root in sources:
+            if not search_root.exists():
+                continue
+            for path in search_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() != ".log" and not path.name.endswith(".capture.json"):
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    relative = path.relative_to(root)
+                except ValueError:
+                    relative = Path(path.name)
+                destination = archive_dir / label / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(path, destination)
+                except OSError as exc:
+                    LOGGER.warning("Could not archive job log %s: %s", path, exc)
+                    continue
+                copied.append(str(destination.resolve()))
+        for label, path in (
+            (
+                "processed",
+                session.mp4_file.with_suffix(".ffmpeg.log") if session.mp4_file else None,
+            ),
+            (
+                "upload",
+                session.upload_file.with_suffix(".hardsub.log")
+                if session.upload_file
+                else None,
+            ),
+        ):
+            if not path or not path.is_file() or path.resolve() in seen:
+                continue
+            destination = archive_dir / label / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(path, destination)
+            except OSError as exc:
+                LOGGER.warning("Could not archive job log %s: %s", path, exc)
+                continue
+            seen.add(path.resolve())
+            copied.append(str(destination.resolve()))
+        if session.mp4_file:
+            for path in session.mp4_file.parent.glob(f"{session.mp4_file.stem}.asr*.log"):
+                if not path.is_file() or path.resolve() in seen:
+                    continue
+                destination = archive_dir / "asr" / path.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(path, destination)
+                except OSError as exc:
+                    LOGGER.warning("Could not archive job log %s: %s", path, exc)
+                    continue
+                seen.add(path.resolve())
+                copied.append(str(destination.resolve()))
+        LOGGER.info("Archived %d job log file(s) for %s", len(copied), session.job_id)
+        return copied
 
     def _remove_cleanup_path(self, path: Path, keep: set[Path]) -> list[str]:
         if not path.exists():
@@ -1257,6 +1591,29 @@ class ShowroomRecorderService:
         if self.config.upload.enabled:
             bin_name = str(self.config.upload.biliup.get("bin", "biliup"))
             assert_tool_available(bin_name)
+        if self.config.baidu_netdisk.enabled:
+            if not self.config.baidu_netdisk.app_key or not self.config.baidu_netdisk.secret_key:
+                LOGGER.warning(
+                    "Baidu Netdisk upload is enabled but AppKey/SecretKey are missing; "
+                    "recordings will be retained"
+                )
+            if not self.config.baidu_netdisk.remote_root:
+                LOGGER.warning(
+                    "Baidu Netdisk upload is enabled but remote_root is empty; recordings will be retained"
+                )
+            if not self.config.baidu_netdisk.token_file.exists():
+                LOGGER.warning(
+                    "Baidu Netdisk upload is enabled but no token file exists; run --baidu-auth. "
+                    "Recordings will be retained"
+                )
+        elif (
+            self.config.upload.cleanup_after_success
+            and self.config.baidu_netdisk.required_for_cleanup
+        ):
+            LOGGER.warning(
+                "Baidu Netdisk is required for cleanup but currently disabled; all recording files "
+                "will be retained"
+            )
 
     def _assert_python_package(self, package: str, message: str) -> None:
         if importlib.util.find_spec(package) is None:

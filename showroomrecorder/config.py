@@ -84,6 +84,7 @@ class RecordConfig:
     reconnect_delay_seconds: float = 5.0
     live_end_confirmations: int = 4
     live_end_check_interval_seconds: float = 20.0
+    live_end_grace_seconds: int = 180
     hls_concurrent_fragments: int = 2
     hls_fragment_retries: int = 5
     capture_realtime_ratio_warning: float = 0.95
@@ -198,6 +199,27 @@ class UploadConfig:
 
 
 @dataclass
+class BaiduNetdiskConfig:
+    enabled: bool = False
+    required_for_cleanup: bool = False
+    app_key: str = ""
+    secret_key: str = ""
+    token_file: Path = Path("data/baidu-netdisk-token.json")
+    state_dir: Path = Path("data/baidu-netdisk/uploads")
+    remote_root: str = ""
+    remote_path_template: str = (
+        "{streamer_slug}/{streamer_slug}_{started_at:%Y%m%d_%H%M%S}_recording-merged.mkv"
+    )
+    conflict_policy: str = "overwrite"
+    chunk_size_mb: int = 4
+    retries: int = 3
+    retry_seconds: float = 2.0
+    request_timeout_seconds: int = 60
+    upload_timeout_seconds: int = 300
+    trust_env: bool = False
+
+
+@dataclass
 class AppConfig:
     config_path: Path
     service: ServiceConfig
@@ -211,6 +233,7 @@ class AppConfig:
     subtitles: SubtitlesConfig
     danmaku: DanmakuConfig
     upload: UploadConfig
+    baidu_netdisk: BaiduNetdiskConfig
 
 
 def load_config(path: Path) -> AppConfig:
@@ -250,6 +273,7 @@ def load_config(path: Path) -> AppConfig:
         1.0,
         float(record.live_end_check_interval_seconds or 1.0),
     )
+    record.live_end_grace_seconds = max(0, int(record.live_end_grace_seconds or 0))
     record.hls_concurrent_fragments = min(
         10,
         max(1, int(record.hls_concurrent_fragments or 1)),
@@ -299,6 +323,35 @@ def load_config(path: Path) -> AppConfig:
     danmaku.top_margin = max(0, int(danmaku.top_margin or 0))
     danmaku.bottom_margin = max(0, int(danmaku.bottom_margin or 0))
 
+    baidu_netdisk = BaiduNetdiskConfig(**(raw.get("baidu_netdisk") or {}))
+    baidu_netdisk.app_key = str(baidu_netdisk.app_key or "").strip()
+    baidu_netdisk.secret_key = str(baidu_netdisk.secret_key or "").strip()
+    baidu_netdisk.token_file = _resolve_path(base_dir, baidu_netdisk.token_file)
+    baidu_netdisk.state_dir = _resolve_path(base_dir, baidu_netdisk.state_dir)
+    baidu_netdisk.remote_root = str(baidu_netdisk.remote_root or "").strip()
+    baidu_netdisk.remote_path_template = str(
+        baidu_netdisk.remote_path_template
+        or "{streamer_slug}/{streamer_slug}_{started_at:%Y%m%d_%H%M%S}_recording-merged.mkv"
+    ).strip()
+    baidu_netdisk.conflict_policy = str(
+        baidu_netdisk.conflict_policy or "overwrite"
+    ).strip().lower()
+    if baidu_netdisk.conflict_policy not in {"fail", "rename", "overwrite"}:
+        raise ValueError(
+            "baidu_netdisk.conflict_policy must be 'fail', 'rename', or 'overwrite'"
+        )
+    baidu_netdisk.chunk_size_mb = max(1, int(baidu_netdisk.chunk_size_mb or 4))
+    baidu_netdisk.retries = max(1, int(baidu_netdisk.retries or 1))
+    baidu_netdisk.retry_seconds = max(0.0, float(baidu_netdisk.retry_seconds or 0.0))
+    baidu_netdisk.request_timeout_seconds = max(
+        1,
+        int(baidu_netdisk.request_timeout_seconds or 1),
+    )
+    baidu_netdisk.upload_timeout_seconds = max(
+        1,
+        int(baidu_netdisk.upload_timeout_seconds or 1),
+    )
+
     config = AppConfig(
         config_path=path,
         service=service,
@@ -312,8 +365,11 @@ def load_config(path: Path) -> AppConfig:
         subtitles=SubtitlesConfig(**(raw.get("subtitles") or {})),
         danmaku=danmaku,
         upload=UploadConfig(**(raw.get("upload") or {})),
+        baidu_netdisk=baidu_netdisk,
     )
     _ensure_dirs(config.paths)
+    config.baidu_netdisk.token_file.parent.mkdir(parents=True, exist_ok=True)
+    config.baidu_netdisk.state_dir.mkdir(parents=True, exist_ok=True)
     return config
 
 

@@ -63,6 +63,7 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
                 reconnect_delay_seconds=0,
                 live_end_confirmations=confirmations,
                 live_end_check_interval_seconds=0,
+                live_end_grace_seconds=0,
             ),
             danmaku=SimpleNamespace(enabled=False),
             paths=SimpleNamespace(
@@ -184,6 +185,40 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recorder.calls, [1])
         service._get_live_status.assert_not_awaited()
+        service._schedule_processing.assert_called_once()
+
+    async def test_reopen_after_merge_continues_the_same_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "capture" / "first.ts"
+            second = root / "capture" / "second.ts"
+            recorder = _FakeRecorder(
+                [first, second],
+                {"first.ts": 8.0, "second.ts": 9.0, "recording-merged.mkv": 17.0},
+            )
+            service = self._service(temp_dir, recorder, confirmations=1)
+            service._get_live_status = AsyncMock(
+                side_effect=[
+                    LiveStatus(is_live=False, raw={"is_onlive": 0}),
+                    LiveStatus(is_live=False, raw={"is_onlive": 0}),
+                ]
+            )
+            service._wait_for_live_reopen = AsyncMock(side_effect=[True, False])
+            room = SimpleNamespace(name="test-room", room_id=123, url="https://example.test/room")
+
+            await service._handle_live(
+                room,
+                LiveStatus(is_live=True, title="test live", raw={"is_onlive": 1}),
+            )
+
+            events = self._events(service)
+
+        self.assertEqual(recorder.calls, [1, 2])
+        self.assertEqual(len(service.media.calls), 2)
+        self.assertEqual(service.media.calls[0][0], [first])
+        self.assertEqual(service.media.calls[1][0], [first, second])
+        self.assertEqual([item["event"] for item in events].count("live_reopened"), 1)
+        self.assertEqual([item["event"] for item in events].count("recorded"), 1)
         service._schedule_processing.assert_called_once()
 
 
