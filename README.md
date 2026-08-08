@@ -332,11 +332,22 @@ upload:
     mode: monthly
     bin: biliup
     user_cookie: "data/biliup-cookies.json"
+    collection:
+      enabled: true
+      title: "showroom直播"
+      season_id: null
+      section_id: null
+      section_title: "正片"
+      page_wait_seconds: 900
+      page_poll_seconds: 30
+      errors_fatal: false
     subtitle_language: zh
     upload_subtitle_draft: true
     subtitle_page_wait_seconds: 900
     subtitle_page_poll_seconds: 30
 ```
+
+`biliup.collection` 用于把本版本之后上传或追加的 BVID 加入 B 站新版合集。可以只配置精确的 `title` 自动查找；配置 `season_id` 和 `section_id` 更稳定。程序不会扫描或回填历史投稿，对已在合集中的视频会直接跳过。`errors_fatal: false` 表示合集接口失败时保留已成功的投稿，并在任务日志记录 `collection_failed`。
 
 默认 `subtitle_mode: hard_subbed`，会先生成一个硬字幕 MP4 再投稿，避免 B 站字幕上传接口变化导致字幕不可见。生成的 `.zh.srt` 仍会保留在本地。
 

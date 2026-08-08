@@ -155,6 +155,16 @@ upload:
     trust_env: false
     bin: "biliup"
     user_cookie: "data/biliup-cookies.json"
+    collection:
+      enabled: false
+      title: "showroom直播"
+      season_id: null
+      section_id: null
+      section_title: "正片"
+      page_wait_seconds: 900
+      page_poll_seconds: 30
+      request_timeout_seconds: 30
+      errors_fatal: false
     line: "kodo"
     limit: 3
     tid: 21

@@ -592,6 +592,7 @@ class ShowroomRecorderService:
             raise
 
         self._append_job_event(session, "uploaded", {"bvid": bvid, "recovered": True})
+        self._append_collection_result_event(session, bvid, recovered=True)
         if bvid and session.metadata.get("subtitle_uploaded"):
             self._append_job_event(session, "subtitle_uploaded", {"bvid": bvid, "recovered": True})
         elif bvid and session.metadata.get("subtitle_upload_error"):
@@ -604,6 +605,28 @@ class ShowroomRecorderService:
                     "error": str(session.metadata["subtitle_upload_error"]),
                 },
             )
+
+    def _append_collection_result_event(
+        self,
+        session: LiveSession,
+        bvid: str | None,
+        *,
+        recovered: bool = False,
+    ) -> None:
+        details = {
+            "bvid": bvid,
+            "season_id": session.metadata.get("collection_season_id"),
+            "section_id": session.metadata.get("collection_section_id"),
+            "aid": session.metadata.get("collection_aid"),
+            "recovered": recovered,
+        }
+        if session.metadata.get("collection_added"):
+            self._append_job_event(session, "collection_added", details)
+        elif session.metadata.get("collection_already_present"):
+            self._append_job_event(session, "collection_present", details)
+        elif session.metadata.get("collection_error"):
+            details["error"] = str(session.metadata["collection_error"])
+            self._append_job_event(session, "collection_failed", details)
 
     def _find_pending_upload_sessions(self) -> list[LiveSession]:
         events = self._read_job_events()
@@ -1033,6 +1056,7 @@ class ShowroomRecorderService:
         event = "uploaded" if self.config.upload.enabled else "upload_skipped"
         self._append_job_event(session, event, {"bvid": bvid})
         if self.config.upload.enabled and bvid:
+            self._append_collection_result_event(session, bvid)
             if session.metadata.get("subtitle_uploaded"):
                 self._append_job_event(session, "subtitle_uploaded", {"bvid": bvid})
             elif session.metadata.get("subtitle_upload_error"):

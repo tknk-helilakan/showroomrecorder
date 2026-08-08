@@ -33,6 +33,10 @@ PREUPLOAD_URL = "https://member.bilibili.com/preupload"
 ARCHIVE_VIEW_URL = "https://member.bilibili.com/x/client/archive/view"
 ADD_URL = "https://member.bilibili.com/x/vu/web/add/v3"
 EDIT_URL = "https://member.bilibili.com/x/vu/web/edit"
+COLLECTION_SEASONS_URL = "https://member.bilibili.com/x2/creative/web/seasons"
+COLLECTION_SECTION_URL = "https://member.bilibili.com/x2/creative/web/season/section"
+COLLECTION_ADD_URL = "https://member.bilibili.com/x2/creative/web/season/section/episodes/add"
+VIDEO_VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 
 
 class BiliupUploader:
@@ -142,6 +146,7 @@ class BiliupUploader:
         if bvid:
             LOGGER.info("Biliup output detected BVID: %s", bvid)
             session.bvid = bvid
+            self._add_to_collection(session, bvid, user_cookie)
 
         if (
             bvid
@@ -178,6 +183,42 @@ class BiliupUploader:
                 if _bool_value(biliup_cfg.get("subtitle_errors_fatal", False), default=False):
                     raise
         return bvid
+
+    def _add_to_collection(self, session: LiveSession, bvid: str, user_cookie: Any) -> None:
+        collection_cfg = self.config.upload.biliup.get("collection")
+        if not isinstance(collection_cfg, dict) or not _bool_value(
+            collection_cfg.get("enabled", False),
+            default=False,
+        ):
+            return
+
+        session.metadata.pop("collection_added", None)
+        session.metadata.pop("collection_already_present", None)
+        session.metadata.pop("collection_error", None)
+        session.metadata["collection_attempted"] = True
+        try:
+            result = BilibiliCollectionUploader(
+                cookie_file=self._resolve_config_path(user_cookie),
+                collection_title=str(collection_cfg.get("title") or "").strip(),
+                season_id=collection_cfg.get("season_id"),
+                section_id=collection_cfg.get("section_id"),
+                section_title=str(collection_cfg.get("section_title") or "").strip(),
+                trust_env=_bool_value(collection_cfg.get("trust_env", False), default=False),
+                page_wait_seconds=int(collection_cfg.get("page_wait_seconds") or 900),
+                page_poll_seconds=int(collection_cfg.get("page_poll_seconds") or 30),
+                request_timeout_seconds=int(collection_cfg.get("request_timeout_seconds") or 30),
+            ).add(bvid)
+            already_present = bool(result.get("already_present"))
+            session.metadata["collection_added"] = not already_present
+            session.metadata["collection_already_present"] = already_present
+            session.metadata["collection_season_id"] = result.get("season_id")
+            session.metadata["collection_section_id"] = result.get("section_id")
+            session.metadata["collection_aid"] = result.get("aid")
+        except Exception as exc:  # noqa: BLE001
+            session.metadata["collection_error"] = str(exc)
+            LOGGER.warning("Could not add %s to the configured Bilibili collection: %s", bvid, exc)
+            if _bool_value(collection_cfg.get("errors_fatal", False), default=False):
+                raise
 
     def _use_small_chunk_upload(self) -> bool:
         cfg = self.config.upload.biliup
@@ -943,6 +984,258 @@ class SmallChunkBilibiliUploader:
         return session
 
 
+class BilibiliCollectionUploader:
+    def __init__(
+        self,
+        *,
+        cookie_file: Path,
+        collection_title: str = "",
+        season_id: Any = None,
+        section_id: Any = None,
+        section_title: str = "",
+        trust_env: bool = False,
+        page_wait_seconds: int = 900,
+        page_poll_seconds: int = 30,
+        request_timeout_seconds: int = 30,
+    ) -> None:
+        self.collection_title = collection_title.strip()
+        self.season_id = _optional_positive_int(season_id, "collection.season_id")
+        self.section_id = _optional_positive_int(section_id, "collection.section_id")
+        self.section_title = section_title.strip()
+        if self.section_id is None and self.season_id is None and not self.collection_title:
+            raise ValueError(
+                "Bilibili collection requires section_id, season_id, or an exact title"
+            )
+
+        self.page_wait_seconds = max(0, int(page_wait_seconds))
+        self.page_poll_seconds = max(1, int(page_poll_seconds))
+        self.request_timeout_seconds = max(1, int(request_timeout_seconds))
+        cookies, _access_token = _load_biliup_login(cookie_file)
+        self.csrf = cookies.get("bili_jct")
+        if not self.csrf:
+            raise RuntimeError("Cookie file does not contain bili_jct")
+
+        self.session = requests.Session()
+        self.session.trust_env = trust_env
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Referer": "https://member.bilibili.com/platform/upload-manager/ep",
+            }
+        )
+        for name, value in cookies.items():
+            self.session.cookies.set(name, value, domain=".bilibili.com")
+
+    def add(self, bvid: str) -> dict[str, Any]:
+        bvid = bvid.strip()
+        if not bvid:
+            raise ValueError("Cannot add an empty BVID to a collection")
+
+        section_id = self._resolve_section_id()
+        deadline = time.monotonic() + self.page_wait_seconds
+        last_error: Exception | None = None
+        while True:
+            try:
+                video = self._get_video_info(bvid)
+                aid = _required_positive_int(video.get("aid"), f"aid for {bvid}")
+                pages = video.get("pages") or []
+                if not pages or not isinstance(pages[0], dict):
+                    raise RuntimeError(f"Bilibili video {bvid} does not have a published page yet")
+                cid = _required_positive_int(pages[0].get("cid"), f"cid for {bvid}")
+                title = str(video.get("title") or bvid).strip() or bvid
+
+                if self._section_contains_aid(section_id, aid):
+                    LOGGER.info(
+                        "Bilibili collection already contains %s (aid=%s, section_id=%s)",
+                        bvid,
+                        aid,
+                        section_id,
+                    )
+                    return self._result(section_id, aid, already_present=True)
+
+                self._post_episode(
+                    section_id,
+                    {
+                        "aid": aid,
+                        "cid": cid,
+                        "title": title,
+                        "charging_pay": 0,
+                    },
+                )
+                LOGGER.info(
+                    "Added %s to Bilibili collection %s (aid=%s, section_id=%s)",
+                    bvid,
+                    self.collection_title or self.season_id or "configured collection",
+                    aid,
+                    section_id,
+                )
+                return self._result(section_id, aid, already_present=False)
+            except (requests.RequestException, RuntimeError) as exc:
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                delay = min(self.page_poll_seconds, max(1, int(remaining)))
+                LOGGER.warning(
+                    "Bilibili collection update for %s is not ready; retrying in %d second(s): %s",
+                    bvid,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError(
+            f"Could not add {bvid} to the Bilibili collection within "
+            f"{self.page_wait_seconds} second(s): {last_error}"
+        ) from last_error
+
+    def _result(self, section_id: int, aid: int, *, already_present: bool) -> dict[str, Any]:
+        return {
+            "season_id": self.season_id,
+            "section_id": section_id,
+            "aid": aid,
+            "already_present": already_present,
+        }
+
+    def _resolve_section_id(self) -> int:
+        if self.section_id is not None:
+            return self.section_id
+
+        matches: list[tuple[int, str, int]] = []
+        page_number = 1
+        page_size = 30
+        while True:
+            payload = self._request_json(
+                "GET",
+                COLLECTION_SEASONS_URL,
+                params={
+                    "pn": page_number,
+                    "ps": page_size,
+                    "order": "mtime",
+                    "sort": "desc",
+                    "draft": 1,
+                },
+            )
+            data = self._api_data(payload, "listing Bilibili collections")
+            seasons = data.get("seasons") or []
+            for item in seasons:
+                if not isinstance(item, dict):
+                    continue
+                season = item.get("season") or {}
+                try:
+                    candidate_season_id = int(season.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                candidate_title = str(season.get("title") or "").strip()
+                if self.season_id is not None and candidate_season_id != self.season_id:
+                    continue
+                if self.collection_title and candidate_title != self.collection_title:
+                    continue
+
+                sections = (item.get("sections") or {}).get("sections") or []
+                for section in sections:
+                    if not isinstance(section, dict):
+                        continue
+                    candidate_section_title = str(section.get("title") or "").strip()
+                    if self.section_title and candidate_section_title != self.section_title:
+                        continue
+                    try:
+                        candidate_section_id = int(section.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    matches.append(
+                        (candidate_season_id, candidate_title, candidate_section_id)
+                    )
+                    break
+
+            page = data.get("page") or {}
+            try:
+                total = int(page.get("total"))
+            except (TypeError, ValueError):
+                total = page_number * page_size if len(seasons) < page_size else 0
+            if len(seasons) < page_size or (total and page_number * page_size >= total):
+                break
+            page_number += 1
+
+        if not matches:
+            identity = self.collection_title or self.season_id
+            section_note = f" / section {self.section_title!r}" if self.section_title else ""
+            raise ValueError(
+                f"Bilibili collection {identity!r}{section_note} was not found for this account"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple Bilibili collections matched {self.collection_title!r}; "
+                "configure collection.season_id or collection.section_id"
+            )
+
+        self.season_id, resolved_title, self.section_id = matches[0]
+        if not self.collection_title:
+            self.collection_title = resolved_title
+        return self.section_id
+
+    def _get_video_info(self, bvid: str) -> dict[str, Any]:
+        payload = self._request_json("GET", VIDEO_VIEW_URL, params={"bvid": bvid})
+        return self._api_data(payload, f"loading Bilibili video {bvid}")
+
+    def _section_contains_aid(self, section_id: int, aid: int) -> bool:
+        payload = self._request_json(
+            "GET",
+            COLLECTION_SECTION_URL,
+            params={"id": section_id},
+        )
+        data = self._api_data(payload, f"loading Bilibili collection section {section_id}")
+        for episode in data.get("episodes") or []:
+            try:
+                if int(episode.get("aid")) == aid:
+                    return True
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return False
+
+    def _post_episode(self, section_id: int, episode: dict[str, Any]) -> None:
+        payload = self._request_json(
+            "POST",
+            COLLECTION_ADD_URL,
+            params={"csrf": self.csrf},
+            json={
+                "sectionId": section_id,
+                "episodes": [episode],
+                "csrf": self.csrf,
+            },
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+        )
+        self._api_data(payload, f"adding aid {episode['aid']} to collection section {section_id}")
+
+    def _request_json(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        response = self.session.request(
+            method,
+            url,
+            timeout=(self.request_timeout_seconds, self.request_timeout_seconds),
+            **kwargs,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Bilibili collection API returned invalid JSON from {url}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Bilibili collection API returned an invalid payload from {url}")
+        return payload
+
+    @staticmethod
+    def _api_data(payload: dict[str, Any], operation: str) -> dict[str, Any]:
+        if payload.get("code") != 0:
+            raise RuntimeError(
+                f"Bilibili API failed while {operation}: "
+                f"code={payload.get('code')} message={payload.get('message') or payload.get('msg')}"
+            )
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+
+
 class SubtitleDraftUploader:
     ENDPOINT = "https://api.bilibili.com/x/v2/dm/subtitle/draft/save"
     PAGELIST = "https://api.bilibili.com/x/player/pagelist"
@@ -1219,6 +1512,28 @@ def _small_chunk_line_query(line: str) -> dict[str, str]:
         return queries[key]
     except KeyError as exc:
         raise ValueError(f"Unsupported small chunk upload line: {line}") from exc
+
+
+def _required_positive_int(value: Any, field: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Bilibili returned an invalid {field}: {value!r}") from exc
+    if result <= 0:
+        raise RuntimeError(f"Bilibili returned an invalid {field}: {value!r}")
+    return result
+
+
+def _optional_positive_int(value: Any, field: str) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if result <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return result
 
 
 def _load_biliup_login(path: Path) -> tuple[dict[str, str], str]:
